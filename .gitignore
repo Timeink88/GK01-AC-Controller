@@ -1,0 +1,29 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Build artifacts
+*.bin
+*.elf
+*.hex
+*.map
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Dev tools
+.spec-workflow/
+
+# Archives
+*.7z
+*.zip
+*.rar
+*.tar
+*.tar.gz
