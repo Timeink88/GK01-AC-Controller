@@ -239,13 +239,36 @@ nav.bar{max-width:var(--max);left:50%;transform:translateX(-50%);border-radius:v
 </div>
 <div id="pg-settings" class="pg">
 <div class="pg-title">设置</div>
+<div class="cd"><div class="cd-h">WiFi</div><div class="cd-b">
+<div id="wifi-status" style="font-size:14px;color:var(--text3);margin-bottom:10px"></div>
+<button class="b b-bl b-fw" style="margin-bottom:10px" onclick="scanWifi()">&#128269; 扫描WiFi</button>
+<div id="wifi-list" style="display:none">
+<div style="max-height:200px;overflow-y:auto;border:.5px solid var(--gray4);border-radius:10px;margin-bottom:10px" id="wifi-scan-results"></div>
+<input type="text" id="wifi-ssid" placeholder="WiFi 名称（SSID）" style="margin-bottom:8px">
+<input type="text" id="wifi-pass" placeholder="WiFi 密码" style="margin-bottom:10px">
+<button class="b b-gn b-fw" onclick="connectWifi()">连接并重启</button>
+</div>
+<div id="wifi-forget-wrap" style="display:none;margin-top:10px">
+<button class="b b-rd b-fw" style="font-size:14px" onclick="forgetWifi()">忘记网络（切回AP模式）</button>
+</div>
+</div></div>
+<div class="cd"><div class="cd-h">MQTT</div><div class="cd-b">
+<input type="text" id="mqtt-host" placeholder="服务器地址（如 192.168.1.100）" style="margin-bottom:8px">
+<div style="display:flex;gap:8px;margin-bottom:8px">
+<input type="text" id="mqtt-port" placeholder="端口" value="1883" style="flex:1">
+<input type="text" id="mqtt-user" placeholder="用户名（可选）" style="flex:1">
+</div>
+<input type="text" id="mqtt-pass" placeholder="密码（可选）" style="margin-bottom:8px">
+<input type="text" id="mqtt-topic" placeholder="Topic 前缀" value="ir_ac" style="margin-bottom:10px">
+<button class="b b-pp b-fw" onclick="saveMqtt()">保存MQTT配置并重启</button>
+</div></div>
 <div class="cd"><div class="cd-h">数据</div>
 <div class="it" onclick="exportAll()"><span>导出配置</span><span class="arr"></span></div>
 <div class="it" onclick="importAll()"><span>导入配置</span><span class="arr"></span></div>
 <div class="it" onclick="clearAll()"><span style="color:var(--red)">清除所有数据</span><span class="arr"></span></div>
 </div>
 <div class="cd"><div class="cd-h">关于</div>
-<div class="it"><span>版本</span><span style="color:var(--gray)">v1.4</span></div>
+<div class="it"><span>版本</span><span style="color:var(--gray)">v2.0</span></div>
 <div class="it"><span>设备</span><span style="color:var(--gray)">IR Mini V105</span></div>
 <div class="it"><span>协议库</span><span style="color:var(--gray)">IRremoteESP8266</span></div>
 </div></div>
@@ -426,6 +449,65 @@ localStorage.removeItem('ir_sigs');localStorage.removeItem('ir_ac_v');
 sigs=[];renderRemote();toast('已清除');
 }
 renderRemote();
+function loadWifiStatus(){
+  fetch('/api/wifi/status').then(function(r){return r.json()}).then(function(d){
+    var s=$('wifi-status');
+    var modeTxt=d.mode==='sta'?'STA 模式':d.mode==='slave'?'从机模式':'AP 模式';
+    s.innerHTML='<b>'+modeTxt+'</b> &nbsp; SSID: '+d.ssid+' &nbsp; IP: '+d.ip+(d.rssi?' &nbsp; RSSI: '+d.rssi:'');
+    if(d.mode==='sta'){$('wifi-forget-wrap').style.display='block'}
+    if(d.mqtt){s.innerHTML+='<br><span style="color:var(--green)">MQTT: 已连接 ('+d.mqtt_host+')</span>'}
+    else if(d.mqtt_host){s.innerHTML+='<br><span style="color:var(--gray)">MQTT: 未连接</span>'}
+  }).catch(function(){});
+}
+loadWifiStatus();
+function scanWifi(){
+  var el=$('wifi-scan-results');el.innerHTML='<div style="padding:12px;text-align:center;color:var(--gray)">扫描中...</div>';
+  $('wifi-list').style.display='block';
+  fetch('/api/wifi/scan').then(function(r){return r.json()}).then(function(list){
+    if(!list.length){el.innerHTML='<div style="padding:12px;text-align:center;color:var(--gray)">没有发现WiFi</div>';return}
+    var h='';
+    list.sort(function(a,b){return b.rssi-a.rssi});
+    list.forEach(function(w){
+      var q=w.rssi>-50?'●●●':w.rssi>-70?'●●○':'●○○';
+      h+='<div class="it" onclick="pickWifi(\''+w.ssid.replace(/'/g,"\\'")+'\')">'
+        +'<span>'+w.ssid+' <span style="color:var(--gray);font-size:12px">'+q+' '+w.rssi+'dBm</span></span>'
+        +(w.enc?'<span style="color:var(--gray);font-size:12px">&#128274;</span>':'')
+        +'</div>';
+    });
+    el.innerHTML=h;
+  }).catch(function(){el.innerHTML='<div style="padding:12px;text-align:center;color:var(--red)">扫描失败</div>'});
+}
+function pickWifi(ssid){$('wifi-ssid').value=ssid;$('wifi-pass').focus()}
+function connectWifi(){
+  var ssid=$('wifi-ssid').value.trim();if(!ssid){toast('请输入WiFi名称');return}
+  toast('正在连接...');
+  fetch('/api/wifi/connect',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:'ssid='+encodeURIComponent(ssid)+'&pass='+encodeURIComponent($('wifi-pass').value)})
+  .then(function(r){return r.json()}).then(function(d){toast(d.ok?'重启中，请等待30秒...':'失败: '+d.error)});
+}
+function forgetWifi(){
+  if(!confirm('确定忘记网络？设备将重启为AP模式'))return;
+  fetch('/api/wifi/forget',{method:'POST'}).then(function(){toast('重启中...')});
+}
+function loadMqttConfig(){
+  fetch('/api/mqtt/config').then(function(r){return r.json()}).then(function(d){
+    if(d.host)$('mqtt-host').value=d.host;
+    if(d.port)$('mqtt-port').value=d.port;
+    if(d.user)$('mqtt-user').value=d.user;
+    if(d.topic)$('mqtt-topic').value=d.topic;
+  }).catch(function(){});
+}
+loadMqttConfig();
+function saveMqtt(){
+  var host=$('mqtt-host').value.trim();if(!host){toast('请输入MQTT服务器地址');return}
+  toast('保存中...');
+  fetch('/api/mqtt/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},
+    body:'host='+encodeURIComponent(host)+'&port='+$('mqtt-port').value
+    +'&user='+encodeURIComponent($('mqtt-user').value)
+    +'&pass='+encodeURIComponent($('mqtt-pass').value)
+    +'&topic='+encodeURIComponent($('mqtt-topic').value)})
+  .then(function(r){return r.json()}).then(function(d){toast(d.ok?'重启中...':'失败')});
+}
 </script>
 </body></html>)rawliteral";
 #endif
