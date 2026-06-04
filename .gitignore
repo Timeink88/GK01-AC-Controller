@@ -26,6 +26,7 @@ tools/
 
 # Internal docs (private)
 docs/
+AGENTS.md
 
 # Codegraph
 .codegraph/
