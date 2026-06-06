@@ -268,10 +268,16 @@ nav.bar{max-width:var(--max);left:50%;transform:translateX(-50%);border-radius:v
 <div class="it" onclick="clearAll()"><span style="color:var(--red)">清除所有数据</span><span class="arr"></span></div>
 </div>
 <div class="cd"><div class="cd-h">关于</div>
-<div class="it"><span>版本</span><span style="color:var(--gray)">v2.0</span></div>
+<div class="it"><span>版本</span><span style="color:var(--gray)">v2.1</span></div>
 <div class="it"><span>设备</span><span style="color:var(--gray)">IR Mini V105</span></div>
 <div class="it"><span>协议库</span><span style="color:var(--gray)">IRremoteESP8266</span></div>
-</div></div>
+</div>
+<div class="cd"><div class="cd-h">固件更新 (OTA)</div><div class="cd-b">
+<div style="font-size:13px;color:var(--text3);margin-bottom:12px">
+通过浏览器上传 .bin 固件文件，无需 USB-TTL 刷写器。升级过程约需 30 秒，期间设备会自动重启。
+</div>
+<a href="/update" target="_blank" class="b b-or b-fw" style="text-decoration:none">&#128260; 打开固件更新页面</a>
+</div></div></div>
 <nav class="bar">
 <a class="active" onclick="go('ac')"><i>&#10052;&#65039;</i>空调</a>
 <a onclick="go('learn')"><i>&#128225;</i>学习</a>

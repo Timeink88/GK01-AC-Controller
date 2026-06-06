@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
+#include <ESP8266HTTPUpdateServer.h>
 #include <WiFiUdp.h>
 #include <DNSServer.h>
 #include <LittleFS.h>
@@ -41,6 +42,7 @@ DeviceMode deviceMode = MODE_AP_MASTER;
 
 // ===== 全局对象 =====
 ESP8266WebServer server(80);
+ESP8266HTTPUpdateServer httpUpdater(true);  // true = 启用认证
 DNSServer dnsServer;
 IRsend irSend(IR_TX);
 IRrecv irRecv(IR_RX, 1024, 50, false);
@@ -649,6 +651,7 @@ void updateSensors() {
 }
 
 void registerApiRoutes() {
+  httpUpdater.setup(&server, "admin", "12345678");
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/hvac", HTTP_POST, handleHvac);
   server.on("/api/send", HTTP_POST, handleSend);
