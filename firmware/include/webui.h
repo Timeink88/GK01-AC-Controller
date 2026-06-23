@@ -120,6 +120,23 @@ body{background:#e8e8ed}
 .pg-title{font-size:34px;letter-spacing:-.8px}
 nav.bar{max-width:var(--max);left:50%;transform:translateX(-50%);border-radius:var(--r) var(--r) 0 0}
 }
+@media(prefers-color-scheme:dark){
+:root{--bg:#000;--card:#1c1c1e;--blue:#0a84ff;--green:#30d158;--red:#ff453a;
+--orange:#ff9f0a;--purple:#bf5af2;--teal:#64d2ff;--pink:#ff375f;
+--gray:#8e8e93;--gray3:#48484a;--gray4:#3a3a3c;--gray5:#2c2c2e;--gray6:#1c1c1e;
+--text:#fff;--text2:#ebebf5;--text3:#ababaf}
+body{background:var(--bg)}
+.hdr{background:rgba(0,0,0,.92);border-bottom-color:var(--gray5)}
+nav.bar{background:rgba(28,28,30,.94);border-top-color:var(--gray4)}
+input[type=text]{background:var(--card);color:var(--text)}
+select{background:var(--card);color:var(--text)}
+.seg{background:var(--gray5)}
+.seg button.active{background:var(--gray4);color:var(--text)}
+.raw-box{background:var(--gray5);color:var(--text3)}
+.temp-b{background:var(--gray5)}
+.grid-b{background:var(--card);border-color:var(--gray4)}
+.b-gy{background:var(--gray5)}
+}
 </style>
 </head>
 <body>
@@ -352,6 +369,12 @@ fetch('/api/hvac',{method:'POST',headers:{'Content-Type':'application/x-www-form
 }
 var sv_=localStorage.getItem('ir_ac_v');if(sv_)$('ac-v').value=sv_;
 $('ac-v').onchange=function(){localStorage.setItem('ir_ac_v',this.value)};
+fetch('/api/hvac/state').then(function(r){return r.json()}).then(function(d){
+  if(d.vendor){$('ac-v').value=d.vendor;localStorage.setItem('ir_ac_v',d.vendor)}
+  if(d.temp)$('t-val').textContent=d.temp;
+  if(d.mode){document.querySelectorAll('#s-mode button').forEach(function(b){b.classList.toggle('active',b.dataset.v===d.mode)})}
+  if(d.fan){document.querySelectorAll('#s-fan button').forEach(function(b){b.classList.toggle('active',b.dataset.v===d.fan)})}
+}).catch(function(){});
 function startPoll(){
 $('learn-st').textContent='监听中';
 if(pollTimer)return;

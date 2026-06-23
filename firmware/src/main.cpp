@@ -71,6 +71,13 @@ struct Config {
   char mqtt_topic[32] = "ir_ac";
   uint8_t force_mode = FORCE_MODE_AUTO;
   char paired_master_bssid[18] = "";
+  char last_vendor[16] = "GREE";
+  char last_mode[8] = "Cool";
+  uint8_t last_temp = 26;
+  char last_fan[8] = "Auto";
+  char device_name[33] = "";
+  char device_icon[12] = "ac";
+  char device_floor[33] = "";
 } cfg;
 
 #define MAX_SLAVES 4
@@ -409,6 +416,13 @@ bool loadConfig() {
     else if (key == "mqtt_topic") { strncpy(cfg.mqtt_topic, val.c_str(), sizeof(cfg.mqtt_topic) - 1); cfg.mqtt_topic[sizeof(cfg.mqtt_topic) - 1] = '\0'; }
     else if (key == "force_mode") cfg.force_mode = (uint8_t)val.toInt();
     else if (key == "paired_master_bssid") { strncpy(cfg.paired_master_bssid, val.c_str(), sizeof(cfg.paired_master_bssid) - 1); cfg.paired_master_bssid[sizeof(cfg.paired_master_bssid) - 1] = '\0'; }
+    else if (key == "last_vendor") { strncpy(cfg.last_vendor, val.c_str(), sizeof(cfg.last_vendor) - 1); cfg.last_vendor[sizeof(cfg.last_vendor) - 1] = '\0'; }
+    else if (key == "last_mode") { strncpy(cfg.last_mode, val.c_str(), sizeof(cfg.last_mode) - 1); cfg.last_mode[sizeof(cfg.last_mode) - 1] = '\0'; }
+    else if (key == "last_temp") cfg.last_temp = (uint8_t)val.toInt();
+    else if (key == "last_fan") { strncpy(cfg.last_fan, val.c_str(), sizeof(cfg.last_fan) - 1); cfg.last_fan[sizeof(cfg.last_fan) - 1] = '\0'; }
+    else if (key == "device_name") { strncpy(cfg.device_name, val.c_str(), sizeof(cfg.device_name) - 1); cfg.device_name[sizeof(cfg.device_name) - 1] = '\0'; }
+    else if (key == "device_icon") { strncpy(cfg.device_icon, val.c_str(), sizeof(cfg.device_icon) - 1); cfg.device_icon[sizeof(cfg.device_icon) - 1] = '\0'; }
+    else if (key == "device_floor") { strncpy(cfg.device_floor, val.c_str(), sizeof(cfg.device_floor) - 1); cfg.device_floor[sizeof(cfg.device_floor) - 1] = '\0'; }
   }
   f.close();
   Serial.printf("[CFG] ap=%s sta=%s mqtt=%s:%d topic=%s\n",
@@ -430,6 +444,13 @@ void saveConfig() {
   f.printf("mqtt_topic=%s\n", cfg.mqtt_topic);
   f.printf("force_mode=%d\n", cfg.force_mode);
   f.printf("paired_master_bssid=%s\n", cfg.paired_master_bssid);
+  f.printf("last_vendor=%s\n", cfg.last_vendor);
+  f.printf("last_mode=%s\n", cfg.last_mode);
+  f.printf("last_temp=%d\n", cfg.last_temp);
+  f.printf("last_fan=%s\n", cfg.last_fan);
+  f.printf("device_name=%s\n", cfg.device_name);
+  f.printf("device_icon=%s\n", cfg.device_icon);
+  f.printf("device_floor=%s\n", cfg.device_floor);
   f.close();
   Serial.println("[CFG] saved");
 }
@@ -527,6 +548,17 @@ void handleHvac() {
   String swing = server.arg("swing");
 
   bool ok = sendHvacCommand(vendor, power, mode, temp, fan, swing);
+
+  if (ok && power) {
+    strncpy(cfg.last_vendor, vendor.c_str(), sizeof(cfg.last_vendor) - 1);
+    cfg.last_vendor[sizeof(cfg.last_vendor) - 1] = '\0';
+    strncpy(cfg.last_mode, mode.c_str(), sizeof(cfg.last_mode) - 1);
+    cfg.last_mode[sizeof(cfg.last_mode) - 1] = '\0';
+    cfg.last_temp = (uint8_t)temp;
+    strncpy(cfg.last_fan, fan.c_str(), sizeof(cfg.last_fan) - 1);
+    cfg.last_fan[sizeof(cfg.last_fan) - 1] = '\0';
+    saveConfig();
+  }
 
   if (deviceMode == MODE_AP_MASTER) {
     char msg[256];
@@ -707,6 +739,16 @@ void handleFactoryReset() {
   LittleFS.remove("/config.txt");
   LittleFS.remove("/ota_state.bin");
   ESP.restart();
+}
+
+void handleHvacState() {
+  String json = "{";
+  json += "\"vendor\":\"" + jsonEscape(String(cfg.last_vendor)) + "\",";
+  json += "\"mode\":\"" + jsonEscape(String(cfg.last_mode)) + "\",";
+  json += "\"temp\":" + String(cfg.last_temp) + ",";
+  json += "\"fan\":\"" + jsonEscape(String(cfg.last_fan)) + "\"";
+  json += "}";
+  server.send(200, "application/json", json);
 }
 
 void handleSystemInfo() {
@@ -1063,6 +1105,7 @@ void registerApiRoutes() {
   server.on("/api/ap/config", HTTP_ANY, handleApConfig);
   server.on("/api/factory/reset", HTTP_POST, handleFactoryReset);
   server.on("/api/sensor", HTTP_GET, handleSensorStatus);
+  server.on("/api/hvac/state", HTTP_GET, handleHvacState);
   server.on("/api/system/info", HTTP_GET, handleSystemInfo);
   server.on("/api/slaves", HTTP_GET, handleSlaves);
   server.on("/api/pair/start", HTTP_POST, handlePairStart);
