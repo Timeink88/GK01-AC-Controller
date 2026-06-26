@@ -4,7 +4,36 @@
 extern "C" {
 #include <user_interface.h>
 }
+
+#ifndef IRAC_RBOOT_OTA
+#define IRAC_RBOOT_OTA 1
+#endif
+
+#if IRAC_RBOOT_OTA
 #include "rboot.h"
+#else
+typedef struct {
+    uint8_t  magic;
+    uint8_t  version;
+    uint8_t  mode;
+    uint8_t  current_rom;
+    uint8_t  gpio_rom;
+    uint8_t  count;
+    uint8_t  unused[2];
+    uint32_t roms[2];
+} rboot_config;
+
+static rboot_config rboot_get_config() {
+    rboot_config conf = {0xE1, 0x01, 0, 0, 0, 1, {0, 0}, {0x000000, 0x000000}};
+    return conf;
+}
+static uint8_t rboot_get_current_rom() { return 0; }
+static bool rboot_set_current_rom(uint8_t) { return false; }
+static uint8_t rboot_get_target_rom() { return 0; }
+static uint32_t rboot_get_rom_address(uint8_t) { return 0; }
+static bool rboot_write_flash(uint32_t, const uint8_t*, size_t) { return false; }
+#endif
+
 #include <WiFiUdp.h>
 #include <DNSServer.h>
 #include <LittleFS.h>
@@ -19,15 +48,45 @@ extern "C" {
 
 #define IR_TX 14
 #define IR_RX 5
-#define SENSOR_TEMP 2   // DS18B20 (GPIO2/D4) — 1-Wire 数据
+#define SENSOR_TEMP 2   // DS18B20 (GPIO2/D4) — 1-Wire 数据；不要作为状态 LED 使用
 #define SENSOR_PIR  16  // AM312 PIR  (GPIO16/D0) — 数字输入
-#define LED_BLUE 2    // 蓝色 LED — 系统状态（低电平点亮）
+#define LED_BLUE 4    // 蓝色 LED — 系统状态（GPIO4/D2，低电平点亮）
 #define LED_RED 12    // 红色 LED — IR 活动（低电平点亮）
 #define LED_YELLOW 13 // 黄色 LED — 状态指示（低电平点亮）
 
 // LED 低电平有效：LOW=亮, HIGH=灭
 #define LED_ON(pin)  digitalWrite(pin, LOW)
 #define LED_OFF(pin) digitalWrite(pin, HIGH)
+
+void setStatusLeds(bool blue, bool red, bool yellow) {
+  if (blue) LED_ON(LED_BLUE); else LED_OFF(LED_BLUE);
+  if (red) LED_ON(LED_RED); else LED_OFF(LED_RED);
+  if (yellow) LED_ON(LED_YELLOW); else LED_OFF(LED_YELLOW);
+}
+
+void blinkStatusLed(uint8_t pin, uint8_t count, uint16_t onMs, uint16_t offMs) {
+  for (uint8_t i = 0; i < count; i++) {
+    LED_ON(pin);
+    delay(onMs);
+    LED_OFF(pin);
+    delay(offMs);
+    yield();
+  }
+}
+
+void blinkLedRestore(uint8_t pin, uint8_t count, uint16_t onMs, uint16_t offMs) {
+  bool wasOn = (digitalRead(pin) == LOW);
+  blinkStatusLed(pin, count, onMs, offMs);
+  if (wasOn) LED_ON(pin);
+  else LED_OFF(pin);
+}
+
+void bootLedSelfTest() {
+  setStatusLeds(true, true, true);
+  delay(300);
+  setStatusLeds(false, false, false);
+  delay(120);
+}
 
 // AP 模式网络参数（主机模式使用）
 #define AP_SSID "IR-AC"
@@ -75,6 +134,7 @@ struct Config {
   char last_mode[8] = "Cool";
   uint8_t last_temp = 26;
   char last_fan[8] = "Auto";
+  bool last_power = false;
   char device_name[33] = "";
   char device_icon[12] = "ac";
   char device_floor[33] = "";
@@ -94,6 +154,7 @@ SlaveInfo slaves[MAX_SLAVES];
 bool pairingMode = false;
 unsigned long pairingUntil = 0;
 #define PAIRING_DURATION_MS 60000
+#define SLAVES_FILE "/slaves.txt"
 
 String slaveIdFromMac(const char* mac) {
   String id = "";
@@ -108,13 +169,124 @@ String mySlaveId() {
   return slaveIdFromMac(WiFi.macAddress().c_str());
 }
 
+int findSlaveSlotByMac(const char* mac) {
+  for (int i = 0; i < MAX_SLAVES; i++) {
+    if (slaves[i].mac[0] != '\0' && strcmp(slaves[i].mac, mac) == 0) return i;
+  }
+  return -1;
+}
+
+int findFreeSlaveSlot() {
+  for (int i = 0; i < MAX_SLAVES; i++) {
+    if (slaves[i].mac[0] == '\0') return i;
+  }
+  return -1;
+}
+
 const char* getApSsid() {
   if (strlen(cfg.ap_ssid)) return cfg.ap_ssid;
-  static char defaultSsid[16];
-  snprintf(defaultSsid, sizeof(defaultSsid), "IR-AC-%04X", (uint16_t)(ESP.getChipId() & 0xFFFF));
-  return defaultSsid;
+  return AP_SSID;
 }
 const char* getApPass() { return strlen(cfg.ap_pass) ? cfg.ap_pass : AP_PASS; }
+
+void copyToBuffer(char* dst, size_t dstSize, const String& value) {
+  if (!dst || dstSize == 0) return;
+  strncpy(dst, value.c_str(), dstSize - 1);
+  dst[dstSize - 1] = '\0';
+}
+
+String sanitizeConfigValue(String value, size_t maxLen) {
+  String out;
+  out.reserve(min(value.length(), maxLen));
+  for (unsigned int i = 0; i < value.length() && out.length() < maxLen; i++) {
+    char c = value.charAt(i);
+    if (c == '\r' || c == '\n') c = ' ';
+    if ((uint8_t)c < 0x20) continue;
+    out += c;
+  }
+  return out;
+}
+
+String sanitizeMetadata(String value, size_t maxLen) {
+  value.trim();
+  String out;
+  out.reserve(min(value.length(), maxLen));
+  for (unsigned int i = 0; i < value.length() && out.length() < maxLen; i++) {
+    char c = value.charAt(i);
+    if (c == '|' || c == ':' || c == '\r' || c == '\n' ||
+        c == '<' || c == '>' || c == '&' || c == '"' ||
+        c == '\'' || c == '`') {
+      c = ' ';
+    }
+    if ((uint8_t)c < 0x20) continue;
+    out += c;
+  }
+  out.trim();
+  return out;
+}
+
+String sanitizeIconKey(String value) {
+  value.trim();
+  String out;
+  out.reserve(11);
+  for (unsigned int i = 0; i < value.length() && out.length() < 11; i++) {
+    char c = value.charAt(i);
+    if (isalnum((unsigned char)c) || c == '_' || c == '-') out += c;
+  }
+  if (out.length() == 0) out = "ac";
+  return out;
+}
+
+bool isValidMacString(const String& mac) {
+  if (mac.length() != 17) return false;
+  for (int i = 0; i < 17; i++) {
+    if (i == 2 || i == 5 || i == 8 || i == 11 || i == 14) {
+      if (mac.charAt(i) != ':') return false;
+    } else if (!isxdigit((unsigned char)mac.charAt(i))) {
+      return false;
+    }
+  }
+  return true;
+}
+
+int hexNibble(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+
+bool parseMacBytes(const char* mac, uint8_t out[6]) {
+  if (!mac || strlen(mac) != 17) return false;
+  for (int i = 0; i < 6; i++) {
+    int pos = i * 3;
+    int hi = hexNibble(mac[pos]);
+    int lo = hexNibble(mac[pos + 1]);
+    if (hi < 0 || lo < 0) return false;
+    if (i < 5 && mac[pos + 2] != ':') return false;
+    out[i] = (uint8_t)((hi << 4) | lo);
+  }
+  return true;
+}
+
+bool replaceLittleFSFile(const char* target, const char* tmp, const char* bak, const char* tag) {
+  LittleFS.remove(bak);
+  bool hadOld = LittleFS.exists(target);
+  if (hadOld && !LittleFS.rename(target, bak)) {
+    Serial.printf("[%s] backup rename failed\n", tag);
+    LittleFS.remove(tmp);
+    return false;
+  }
+
+  if (!LittleFS.rename(tmp, target)) {
+    Serial.printf("[%s] commit rename failed\n", tag);
+    if (hadOld) LittleFS.rename(bak, target);
+    return false;
+  }
+
+  if (hadOld) LittleFS.remove(bak);
+  return true;
+}
 
 const char* modeString() {
   switch (deviceMode) {
@@ -140,13 +312,22 @@ unsigned long lastReconnectAttempt = 0;
 unsigned long lastMqttReconnect = 0;
 unsigned long lastHelloSent = 0;
 #define HELLO_INTERVAL_MS 30000
+bool masterApStarted = false;
 
 // ===== GPIO13 按键（与黄色 LED 复用）=====
 unsigned long btnPressStart = 0;
 bool btnPressed = false;
+bool btnLongHandled = false;
 unsigned long lastBtnCheck = 0;
 #define BTN_CHECK_INTERVAL 50   // 按键轮询间隔 (ms)
 #define BTN_LONG_PRESS_MS 5000  // 长按恢复出厂阈值 (ms)
+#define BTN_SHORT_PRESS_MIN_MS 80
+#define BTN_SHORT_PRESS_MAX_MS 1200
+#define OFFICE_PRESET_VENDOR "GREE"
+#define OFFICE_PRESET_MODE   "Cool"
+#define OFFICE_PRESET_TEMP   26
+#define OFFICE_PRESET_FAN    "Auto"
+#define OFFICE_PRESET_SWING  "Off"
 bool mqttEnabled = false;
 
 // ===== 运行状态（用于 MQTT 状态上报）=====
@@ -160,6 +341,7 @@ String currentFan = "Auto";
 OneWire oneWire(SENSOR_TEMP);
 DallasTemperature dallas(&oneWire);
 bool sensorPresent = false;
+bool sensorsInitialized = false;
 float roomTempC = -127.0;
 bool pirDetected = false;
 unsigned long lastSensorRead = 0;
@@ -182,8 +364,16 @@ OTAState otaState = {OTA_STATE_MAGIC, OTA_STATE_VERSION, false, 0, 0};
 static size_t otaUploadSize = 0;
 static uint32_t otaTargetAddr = 0;
 static bool otaWriteOk = true;
+static bool otaHeaderChecked = false;
+static char otaRejectReason[96] = "";
 static uint8_t otaAccBuf[4096];
 static size_t otaAccLen = 0;
+static unsigned long otaConfirmAt = 0;  // loop 中确认 OTA 的时间点（0=不确认）
+#define OTA_CONFIRM_DELAY_MS 25000      // setup 基本检查通过后再稳定运行 25 秒确认
+#define OTA_MAX_CRASH_BOOTS 3           // OTA pending 期间允许的最大启动次数，超过则回滚
+#define OTA_SLOT_MAX_SIZE 0xFE000       // 每个 rboot ROM slot 约 1016KB
+#define OTA_APP_FIRST_SECTION 0x40202010UL
+#define OTA_FLASH_MODE_DOUT 0x03
 
 // ===== 华凌自定义编码器 =====
 #define WAHIN_HDR_MARK    4380
@@ -414,6 +604,10 @@ void mqttPublishState();
 // ===== 配置持久化 =====
 bool loadConfig() {
   File f = LittleFS.open("/config.txt", "r");
+  if (!f) {
+    f = LittleFS.open("/config.bak", "r");
+    if (f) Serial.println("[CFG] config.txt missing, loading backup");
+  }
   if (!f) return false;
   String line;
   while (f.available()) {
@@ -423,33 +617,37 @@ bool loadConfig() {
     if (eq < 0) continue;
     String key = line.substring(0, eq);
     String val = line.substring(eq + 1);
-    if (key == "ap_ssid") { strncpy(cfg.ap_ssid, val.c_str(), sizeof(cfg.ap_ssid) - 1); cfg.ap_ssid[sizeof(cfg.ap_ssid) - 1] = '\0'; }
-    else if (key == "ap_pass") { strncpy(cfg.ap_pass, val.c_str(), sizeof(cfg.ap_pass) - 1); cfg.ap_pass[sizeof(cfg.ap_pass) - 1] = '\0'; }
-    else if (key == "ssid") { strncpy(cfg.sta_ssid, val.c_str(), sizeof(cfg.sta_ssid) - 1); cfg.sta_ssid[sizeof(cfg.sta_ssid) - 1] = '\0'; }
-    else if (key == "pass") { strncpy(cfg.sta_pass, val.c_str(), sizeof(cfg.sta_pass) - 1); cfg.sta_pass[sizeof(cfg.sta_pass) - 1] = '\0'; }
-    else if (key == "mqtt_host") { strncpy(cfg.mqtt_host, val.c_str(), sizeof(cfg.mqtt_host) - 1); cfg.mqtt_host[sizeof(cfg.mqtt_host) - 1] = '\0'; }
+    if (key == "ap_ssid") copyToBuffer(cfg.ap_ssid, sizeof(cfg.ap_ssid), sanitizeConfigValue(val, sizeof(cfg.ap_ssid) - 1));
+    else if (key == "ap_pass") copyToBuffer(cfg.ap_pass, sizeof(cfg.ap_pass), sanitizeConfigValue(val, sizeof(cfg.ap_pass) - 1));
+    else if (key == "ssid") copyToBuffer(cfg.sta_ssid, sizeof(cfg.sta_ssid), sanitizeConfigValue(val, sizeof(cfg.sta_ssid) - 1));
+    else if (key == "pass") copyToBuffer(cfg.sta_pass, sizeof(cfg.sta_pass), sanitizeConfigValue(val, sizeof(cfg.sta_pass) - 1));
+    else if (key == "mqtt_host") copyToBuffer(cfg.mqtt_host, sizeof(cfg.mqtt_host), sanitizeConfigValue(val, sizeof(cfg.mqtt_host) - 1));
     else if (key == "mqtt_port") cfg.mqtt_port = val.toInt();
-    else if (key == "mqtt_user") { strncpy(cfg.mqtt_user, val.c_str(), sizeof(cfg.mqtt_user) - 1); cfg.mqtt_user[sizeof(cfg.mqtt_user) - 1] = '\0'; }
-    else if (key == "mqtt_pass") { strncpy(cfg.mqtt_pass, val.c_str(), sizeof(cfg.mqtt_pass) - 1); cfg.mqtt_pass[sizeof(cfg.mqtt_pass) - 1] = '\0'; }
-    else if (key == "mqtt_topic") { strncpy(cfg.mqtt_topic, val.c_str(), sizeof(cfg.mqtt_topic) - 1); cfg.mqtt_topic[sizeof(cfg.mqtt_topic) - 1] = '\0'; }
+    else if (key == "mqtt_user") copyToBuffer(cfg.mqtt_user, sizeof(cfg.mqtt_user), sanitizeConfigValue(val, sizeof(cfg.mqtt_user) - 1));
+    else if (key == "mqtt_pass") copyToBuffer(cfg.mqtt_pass, sizeof(cfg.mqtt_pass), sanitizeConfigValue(val, sizeof(cfg.mqtt_pass) - 1));
+    else if (key == "mqtt_topic") copyToBuffer(cfg.mqtt_topic, sizeof(cfg.mqtt_topic), sanitizeConfigValue(val, sizeof(cfg.mqtt_topic) - 1));
     else if (key == "force_mode") cfg.force_mode = (uint8_t)val.toInt();
-    else if (key == "paired_master_bssid") { strncpy(cfg.paired_master_bssid, val.c_str(), sizeof(cfg.paired_master_bssid) - 1); cfg.paired_master_bssid[sizeof(cfg.paired_master_bssid) - 1] = '\0'; }
-    else if (key == "last_vendor") { strncpy(cfg.last_vendor, val.c_str(), sizeof(cfg.last_vendor) - 1); cfg.last_vendor[sizeof(cfg.last_vendor) - 1] = '\0'; }
-    else if (key == "last_mode") { strncpy(cfg.last_mode, val.c_str(), sizeof(cfg.last_mode) - 1); cfg.last_mode[sizeof(cfg.last_mode) - 1] = '\0'; }
+    else if (key == "paired_master_bssid") copyToBuffer(cfg.paired_master_bssid, sizeof(cfg.paired_master_bssid), sanitizeConfigValue(val, sizeof(cfg.paired_master_bssid) - 1));
+    else if (key == "last_vendor") copyToBuffer(cfg.last_vendor, sizeof(cfg.last_vendor), sanitizeConfigValue(val, sizeof(cfg.last_vendor) - 1));
+    else if (key == "last_mode") copyToBuffer(cfg.last_mode, sizeof(cfg.last_mode), sanitizeConfigValue(val, sizeof(cfg.last_mode) - 1));
     else if (key == "last_temp") cfg.last_temp = (uint8_t)val.toInt();
-    else if (key == "last_fan") { strncpy(cfg.last_fan, val.c_str(), sizeof(cfg.last_fan) - 1); cfg.last_fan[sizeof(cfg.last_fan) - 1] = '\0'; }
-    else if (key == "device_name") { strncpy(cfg.device_name, val.c_str(), sizeof(cfg.device_name) - 1); cfg.device_name[sizeof(cfg.device_name) - 1] = '\0'; }
-    else if (key == "device_icon") { strncpy(cfg.device_icon, val.c_str(), sizeof(cfg.device_icon) - 1); cfg.device_icon[sizeof(cfg.device_icon) - 1] = '\0'; }
-    else if (key == "device_floor") { strncpy(cfg.device_floor, val.c_str(), sizeof(cfg.device_floor) - 1); cfg.device_floor[sizeof(cfg.device_floor) - 1] = '\0'; }
+    else if (key == "last_fan") copyToBuffer(cfg.last_fan, sizeof(cfg.last_fan), sanitizeConfigValue(val, sizeof(cfg.last_fan) - 1));
+    else if (key == "last_power") cfg.last_power = (val.toInt() != 0);
+    else if (key == "device_name") copyToBuffer(cfg.device_name, sizeof(cfg.device_name), sanitizeMetadata(val, sizeof(cfg.device_name) - 1));
+    else if (key == "device_icon") copyToBuffer(cfg.device_icon, sizeof(cfg.device_icon), sanitizeIconKey(val));
+    else if (key == "device_floor") copyToBuffer(cfg.device_floor, sizeof(cfg.device_floor), sanitizeMetadata(val, sizeof(cfg.device_floor) - 1));
   }
   f.close();
+  if (cfg.force_mode > FORCE_MODE_HOME) cfg.force_mode = FORCE_MODE_AUTO;
+  if (cfg.mqtt_port == 0) cfg.mqtt_port = 1883;
+  cfg.last_temp = constrain(cfg.last_temp, 16, 30);
   Serial.printf("[CFG] ap=%s sta=%s mqtt=%s:%d topic=%s\n",
     getApSsid(), cfg.sta_ssid, cfg.mqtt_host, cfg.mqtt_port, cfg.mqtt_topic);
   return strlen(cfg.sta_ssid) > 0;
 }
 
 void saveConfig() {
-  File f = LittleFS.open("/config.txt", "w");
+  File f = LittleFS.open("/config.tmp", "w");
   if (!f) { Serial.println("[CFG] write failed"); return; }
   f.printf("ap_ssid=%s\n", cfg.ap_ssid);
   f.printf("ap_pass=%s\n", cfg.ap_pass);
@@ -466,11 +664,121 @@ void saveConfig() {
   f.printf("last_mode=%s\n", cfg.last_mode);
   f.printf("last_temp=%d\n", cfg.last_temp);
   f.printf("last_fan=%s\n", cfg.last_fan);
+  f.printf("last_power=%d\n", cfg.last_power ? 1 : 0);
   f.printf("device_name=%s\n", cfg.device_name);
   f.printf("device_icon=%s\n", cfg.device_icon);
   f.printf("device_floor=%s\n", cfg.device_floor);
   f.close();
+  if (!replaceLittleFSFile("/config.txt", "/config.tmp", "/config.bak", "CFG")) return;
   Serial.println("[CFG] saved");
+}
+
+void enterRecoveryAp(const char* reason) {
+  Serial.printf("[RECOVERY] %s; opening AP mode for configuration\n", reason);
+  blinkStatusLed(LED_RED, 3, 80, 80);
+  deviceMode = MODE_AP_MASTER;
+
+  if (cfg.force_mode != FORCE_MODE_AUTO) {
+    cfg.force_mode = FORCE_MODE_AUTO;
+    saveConfig();
+  }
+}
+
+bool startMasterAp() {
+  masterApStarted = false;
+  WiFi.mode(WIFI_AP);
+  IPAddress local_IP(AP_IP);
+  IPAddress gateway(AP_GATEWAY);
+  IPAddress subnet(AP_SUBNET);
+  if (!WiFi.softAPConfig(local_IP, gateway, subnet)) {
+    Serial.println("[MASTER] softAPConfig failed");
+  }
+
+  bool ok = WiFi.softAP(getApSsid(), getApPass(), 1);
+  if (!ok && strlen(cfg.ap_pass) > 0) {
+    Serial.println("[MASTER] AP start failed, clearing custom AP password");
+    cfg.ap_pass[0] = '\0';
+    saveConfig();
+    ok = WiFi.softAP(getApSsid(), getApPass(), 1);
+  }
+
+  if (!ok && strlen(cfg.ap_ssid) > 0) {
+    Serial.println("[MASTER] AP start failed, clearing custom AP SSID");
+    cfg.ap_ssid[0] = '\0';
+    saveConfig();
+    ok = WiFi.softAP(getApSsid(), getApPass(), 1);
+  }
+
+  if (!ok) {
+    Serial.println("[MASTER] AP start failed");
+    blinkStatusLed(LED_RED, 8, 80, 80);
+    return false;
+  }
+
+  Serial.printf("[MASTER] AP: %s  http://%s\n",
+                getApSsid(), WiFi.softAPIP().toString().c_str());
+  masterApStarted = true;
+  return true;
+}
+
+void clearSlaveSlot(int slot) {
+  if (slot < 0 || slot >= MAX_SLAVES) return;
+  slaves[slot] = SlaveInfo();
+}
+
+void loadPairedSlaves() {
+  for (int i = 0; i < MAX_SLAVES; i++) clearSlaveSlot(i);
+
+  File f = LittleFS.open(SLAVES_FILE, "r");
+  if (!f) return;
+
+  int slot = 0;
+  while (f.available() && slot < MAX_SLAVES) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+
+    int p1 = line.indexOf('|');
+    int p2 = line.indexOf('|', p1 + 1);
+    int p3 = line.indexOf('|', p2 + 1);
+    if (p1 != 17 || p2 < 0 || p3 < 0) continue;
+
+    String mac = line.substring(0, p1);
+    String name = line.substring(p1 + 1, p2);
+    String icon = line.substring(p2 + 1, p3);
+    String floor = line.substring(p3 + 1);
+    if (!isValidMacString(mac)) continue;
+    name = sanitizeMetadata(name, sizeof(slaves[slot].name) - 1);
+    icon = sanitizeIconKey(icon);
+    floor = sanitizeMetadata(floor, sizeof(slaves[slot].floor) - 1);
+
+    copyToBuffer(slaves[slot].mac, sizeof(slaves[slot].mac), mac);
+    copyToBuffer(slaves[slot].name, sizeof(slaves[slot].name), name);
+    copyToBuffer(slaves[slot].icon, sizeof(slaves[slot].icon), icon);
+    copyToBuffer(slaves[slot].floor, sizeof(slaves[slot].floor), floor);
+    slaves[slot].ip = 0;
+    slaves[slot].lastSeen = 0;
+    slot++;
+  }
+  f.close();
+  Serial.printf("[SLAVE] Loaded %d paired slave(s)\n", slot);
+}
+
+void savePairedSlaves() {
+  File f = LittleFS.open("/slaves.tmp", "w");
+  if (!f) { Serial.println("[SLAVE] paired slave save failed"); return; }
+
+  for (int i = 0; i < MAX_SLAVES; i++) {
+    if (slaves[i].mac[0] == '\0') continue;
+    String name = sanitizeMetadata(String(slaves[i].name), sizeof(slaves[i].name) - 1);
+    String icon = sanitizeIconKey(String(slaves[i].icon));
+    String floor = sanitizeMetadata(String(slaves[i].floor), sizeof(slaves[i].floor) - 1);
+    f.printf("%s|%s|%s|%s\n", slaves[i].mac, name.c_str(), icon.c_str(), floor.c_str());
+  }
+  f.close();
+
+  if (!replaceLittleFSFile(SLAVES_FILE, "/slaves.tmp", "/slaves.bak", "SLAVE")) return;
+  Serial.println("[SLAVE] paired slaves saved");
 }
 
 // ===== HTTP 页面处理 =====
@@ -490,34 +798,44 @@ void handleRoot() {
   server.sendContent("");
 }
 
-boolean captivePortal() {
+void handleCaptive() {
+  String uri = server.uri();
+  if (uri.startsWith("/api/") || uri == "/update") {
+    server.send(404, "application/json", "{\"ok\":false,\"error\":\"not_found\"}");
+    return;
+  }
+  if (uri == "/wpad.dat") { server.send(404, "text/plain", ""); return; }
   String host = server.hostHeader();
-  if (host.indexOf("10.1.1.1") >= 0 || host.indexOf("ir-ac") >= 0) return false;
-  server.sendHeader("Location", "http://10.1.1.1/", true);
+  if (host.indexOf(AP_IP_STR) >= 0) { handleRoot(); return; }
+  const char* target = (uri == "/connecttest.txt")
+    ? "http://logout.net"
+    : "http://" AP_IP_STR "/";
+  server.sendHeader("Location", target, true);
   server.send(302, "text/plain", "");
   server.client().stop();
-  return true;
-}
-
-void handleCaptive() {
-  if (captivePortal()) return;
-  handleRoot();
 }
 
 // ===== 空调控制（核心）=====
 bool sendHvacCommand(String vendor, bool power, String mode, int temp, String fan, String swing) {
-  currentVendor = vendor;
-  currentPower = power;
-  currentMode = mode;
-  currentTemp = temp;
-  currentFan = fan;
+  int minTemp = (vendor == "WAHIN") ? 17 : 16;
+  temp = constrain(temp, minTemp, 30);
 
   if (vendor == "GREE") {
     sendGreeYBOFB(power, mode, temp, fan);
+    currentVendor = vendor;
+    currentPower = power;
+    currentMode = mode;
+    currentTemp = temp;
+    currentFan = fan;
     return true;
   }
   if (vendor == "WAHIN") {
     sendWahin(power, mode, temp, fan, swing);
+    currentVendor = vendor;
+    currentPower = power;
+    currentMode = mode;
+    currentTemp = temp;
+    currentFan = fan;
     return true;
   }
 
@@ -538,6 +856,13 @@ bool sendHvacCommand(String vendor, bool power, String mode, int temp, String fa
   irRecv.disableIRIn();
   bool ok = ac.sendAc(st);
   irRecv.enableIRIn();
+  if (ok) {
+    currentVendor = vendor;
+    currentPower = power;
+    currentMode = mode;
+    currentTemp = temp;
+    currentFan = fan;
+  }
   return ok;
 }
 
@@ -559,6 +884,7 @@ void handleHvac() {
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"temp_out_of_range\"}");
     return;
   }
+  temp = constrain(temp, (vendor == "WAHIN") ? 17 : 16, 30);
 
   bool power = server.arg("power") == "On";
   String mode = server.arg("mode");
@@ -567,18 +893,16 @@ void handleHvac() {
 
   bool ok = sendHvacCommand(vendor, power, mode, temp, fan, swing);
 
-  if (ok && power) {
-    strncpy(cfg.last_vendor, vendor.c_str(), sizeof(cfg.last_vendor) - 1);
-    cfg.last_vendor[sizeof(cfg.last_vendor) - 1] = '\0';
-    strncpy(cfg.last_mode, mode.c_str(), sizeof(cfg.last_mode) - 1);
-    cfg.last_mode[sizeof(cfg.last_mode) - 1] = '\0';
+  if (ok) {
+    copyToBuffer(cfg.last_vendor, sizeof(cfg.last_vendor), vendor);
+    copyToBuffer(cfg.last_mode, sizeof(cfg.last_mode), mode);
     cfg.last_temp = (uint8_t)temp;
-    strncpy(cfg.last_fan, fan.c_str(), sizeof(cfg.last_fan) - 1);
-    cfg.last_fan[sizeof(cfg.last_fan) - 1] = '\0';
+    copyToBuffer(cfg.last_fan, sizeof(cfg.last_fan), fan);
+    cfg.last_power = power;
     saveConfig();
   }
 
-  if (deviceMode == MODE_AP_MASTER) {
+  if (ok && deviceMode == MODE_AP_MASTER) {
     String target = server.arg("target");
     if (target.length() == 0) target = "ALL";
     char msg[280];
@@ -588,7 +912,7 @@ void handleHvac() {
     broadcastUdp(msg);
   }
 
-  if (mqttEnabled && mqtt.connected()) {
+  if (ok && mqttEnabled && mqtt.connected()) {
     mqttPublishState();
   }
 
@@ -606,7 +930,7 @@ void handleSend() {
     return;
   }
 
-  uint16_t buf[512];
+  static uint16_t buf[512];  // 1KB — 改 static 避免栈爆（handleSend 不重入）
   int len = parseRaw(raw, buf, 512);
   if (len == 0) {
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"parse_error\"}");
@@ -638,12 +962,10 @@ void handleCapture() {
     return;
   }
 
-  noInterrupts();
   String raw = capturedRaw;
   String proto = capturedProto;
   int bits = capturedBits;
   hasNewCapture = false;
-  interrupts();
 
   size_t len = raw.length() + proto.length() + 64;
   char* json = (char*)malloc(len);
@@ -672,16 +994,14 @@ void handleWifiScan() {
 }
 
 void handleWifiConnect() {
-  String ssid = server.arg("ssid");
-  String pass = server.arg("pass");
+  String ssid = sanitizeConfigValue(server.arg("ssid"), sizeof(cfg.sta_ssid) - 1);
+  String pass = sanitizeConfigValue(server.arg("pass"), sizeof(cfg.sta_pass) - 1);
   if (ssid.length() == 0) {
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"empty_ssid\"}");
     return;
   }
-  strncpy(cfg.sta_ssid, ssid.c_str(), sizeof(cfg.sta_ssid) - 1);
-  cfg.sta_ssid[sizeof(cfg.sta_ssid) - 1] = '\0';
-  strncpy(cfg.sta_pass, pass.c_str(), sizeof(cfg.sta_pass) - 1);
-  cfg.sta_pass[sizeof(cfg.sta_pass) - 1] = '\0';
+  copyToBuffer(cfg.sta_ssid, sizeof(cfg.sta_ssid), ssid);
+  copyToBuffer(cfg.sta_pass, sizeof(cfg.sta_pass), pass);
   saveConfig();
   server.send(200, "application/json", "{\"ok\":true,\"msg\":\"rebooting\"}");
   delay(500);
@@ -697,11 +1017,11 @@ void handleWifiStatus() {
     json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
     json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
   } else if (deviceMode == MODE_AP_MASTER) {
-    json += "\"ssid\":\"" + String(getApSsid()) + "\",";
+    json += "\"ssid\":\"" + jsonEscape(String(getApSsid())) + "\",";
     json += "\"ip\":\"" + WiFi.softAPIP().toString() + "\",";
     json += "\"rssi\":0,";
   } else {
-    json += "\"ssid\":\"" + String(getApSsid()) + "\",";
+    json += "\"ssid\":\"" + jsonEscape(String(getApSsid())) + "\",";
     json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
     json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
   }
@@ -729,8 +1049,8 @@ void handleApConfig() {
     server.send(200, "application/json", json);
     return;
   }
-  String ssid = server.arg("ssid");
-  String pass = server.arg("pass");
+  String ssid = sanitizeConfigValue(server.arg("ssid"), sizeof(cfg.ap_ssid) - 1);
+  String pass = sanitizeConfigValue(server.arg("pass"), sizeof(cfg.ap_pass) - 1);
   if (ssid.length() == 0 || ssid.length() > 32) {
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid_ssid\"}");
     return;
@@ -743,10 +1063,8 @@ void handleApConfig() {
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"password_max_32\"}");
     return;
   }
-  strncpy(cfg.ap_ssid, ssid.c_str(), sizeof(cfg.ap_ssid) - 1);
-  cfg.ap_ssid[sizeof(cfg.ap_ssid) - 1] = '\0';
-  strncpy(cfg.ap_pass, pass.c_str(), sizeof(cfg.ap_pass) - 1);
-  cfg.ap_pass[sizeof(cfg.ap_pass) - 1] = '\0';
+  copyToBuffer(cfg.ap_ssid, sizeof(cfg.ap_ssid), ssid);
+  copyToBuffer(cfg.ap_pass, sizeof(cfg.ap_pass), pass);
   saveConfig();
   server.send(200, "application/json", "{\"ok\":true,\"msg\":\"rebooting\"}");
   delay(500);
@@ -757,7 +1075,10 @@ void handleFactoryReset() {
   server.send(200, "application/json", "{\"ok\":true,\"msg\":\"rebooting\"}");
   delay(500);
   LittleFS.remove("/config.txt");
+  LittleFS.remove("/config.bak");
   LittleFS.remove("/ota_state.bin");
+  LittleFS.remove(SLAVES_FILE);
+  LittleFS.remove("/slaves.bak");
   ESP.restart();
 }
 
@@ -766,7 +1087,8 @@ void handleHvacState() {
   json += "\"vendor\":\"" + jsonEscape(String(cfg.last_vendor)) + "\",";
   json += "\"mode\":\"" + jsonEscape(String(cfg.last_mode)) + "\",";
   json += "\"temp\":" + String(cfg.last_temp) + ",";
-  json += "\"fan\":\"" + jsonEscape(String(cfg.last_fan)) + "\"";
+  json += "\"fan\":\"" + jsonEscape(String(cfg.last_fan)) + "\",";
+  json += "\"power\":" + String(cfg.last_power ? "true" : "false");
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -793,25 +1115,10 @@ void refreshSlaveListFromSDK() {
     snprintf(mac, sizeof(mac), "%02X:%02X:%02X:%02X:%02X:%02X",
              stat_info->bssid[0], stat_info->bssid[1], stat_info->bssid[2],
              stat_info->bssid[3], stat_info->bssid[4], stat_info->bssid[5]);
-    bool found = false;
-    for (int i = 0; i < MAX_SLAVES; i++) {
-      if (strcmp(slaves[i].mac, mac) == 0) {
-        slaves[i].ip = stat_info->ip.addr;
-        slaves[i].lastSeen = millis();
-        found = true;
-        break;
-      }
-    }
-    if (!found) {
-      for (int i = 0; i < MAX_SLAVES; i++) {
-        if (slaves[i].mac[0] == '\0') {
-          strncpy(slaves[i].mac, mac, 17);
-          slaves[i].mac[17] = '\0';
-          slaves[i].ip = stat_info->ip.addr;
-          slaves[i].lastSeen = millis();
-          break;
-        }
-      }
+    int slot = findSlaveSlotByMac(mac);
+    if (slot >= 0) {
+      slaves[slot].ip = stat_info->ip.addr;
+      slaves[slot].lastSeen = millis();
     }
     stat_info = STAILQ_NEXT(stat_info, next);
   }
@@ -828,7 +1135,8 @@ void handleSlaves() {
   String json = "{\"slaves\":[";
   bool first = true;
   for (int i = 0; i < MAX_SLAVES; i++) {
-    if (slaves[i].mac[0] != '\0' && (now - slaves[i].lastSeen) < 30000) {
+    if (slaves[i].mac[0] != '\0' && slaves[i].lastSeen != 0 &&
+        (now - slaves[i].lastSeen) < 30000) {
       if (!first) json += ",";
       json += "{\"mac\":\"" + String(slaves[i].mac) + "\",";
       json += "\"id\":\"" + slaveIdFromMac(slaves[i].mac) + "\",";
@@ -856,9 +1164,11 @@ void handleSlaveConfig() {
     return;
   }
   IPAddress targetIp(0,0,0,0);
+  int slot = -1;
   for (int i = 0; i < MAX_SLAVES; i++) {
     if (slaveIdFromMac(slaves[i].mac) == targetId) {
       targetIp = slaves[i].ip;
+      slot = i;
       break;
     }
   }
@@ -866,11 +1176,44 @@ void handleSlaveConfig() {
     server.send(404, "application/json", "{\"ok\":false,\"error\":\"slave_not_found\"}");
     return;
   }
+  bool valueCmd = (cmd == "name" || cmd == "icon" || cmd == "floor" ||
+                   cmd == "ap_ssid" || cmd == "ap_pass");
+  bool actionCmd = (cmd == "reboot" || cmd == "disconnect");
+  if (!valueCmd && !actionCmd) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid_cmd\"}");
+    return;
+  }
+  String safeVal = val;
+  if (cmd == "name") safeVal = sanitizeMetadata(val, sizeof(slaves[0].name) - 1);
+  else if (cmd == "icon") safeVal = sanitizeIconKey(val);
+  else if (cmd == "floor") safeVal = sanitizeMetadata(val, sizeof(slaves[0].floor) - 1);
+  else if (cmd == "ap_ssid") safeVal = sanitizeConfigValue(val, sizeof(cfg.ap_ssid) - 1);
+  else if (cmd == "ap_pass") safeVal = sanitizeConfigValue(val, sizeof(cfg.ap_pass) - 1);
+
   String msg = "CONFIG:" + targetId + ":" + cmd;
-  if (val.length() > 0) msg += "=" + val;
+  if (valueCmd) msg += "=" + safeVal;
   udp.beginPacket(targetIp, UDP_PORT);
   udp.print(msg);
   udp.endPacket();
+
+  if (slot >= 0) {
+    bool shouldSave = false;
+    if (cmd == "name") {
+      copyToBuffer(slaves[slot].name, sizeof(slaves[slot].name), safeVal);
+      shouldSave = true;
+    } else if (cmd == "icon") {
+      copyToBuffer(slaves[slot].icon, sizeof(slaves[slot].icon), safeVal);
+      shouldSave = true;
+    } else if (cmd == "floor") {
+      copyToBuffer(slaves[slot].floor, sizeof(slaves[slot].floor), safeVal);
+      shouldSave = true;
+    } else if (cmd == "disconnect") {
+      clearSlaveSlot(slot);
+      shouldSave = true;
+    }
+    if (shouldSave) savePairedSlaves();
+  }
+
   server.send(200, "application/json", "{\"ok\":true,\"msg\":\"sent\"}");
 }
 
@@ -887,9 +1230,9 @@ void handleDeviceConfig() {
   String name = server.arg("name");
   String icon = server.arg("icon");
   String floor = server.arg("floor");
-  if (name.length() > 0) { strncpy(cfg.device_name, name.c_str(), 32); cfg.device_name[32] = '\0'; }
-  if (icon.length() > 0) { strncpy(cfg.device_icon, icon.c_str(), 11); cfg.device_icon[11] = '\0'; }
-  if (floor.length() > 0) { strncpy(cfg.device_floor, floor.c_str(), 32); cfg.device_floor[32] = '\0'; }
+  if (server.hasArg("name")) copyToBuffer(cfg.device_name, sizeof(cfg.device_name), sanitizeMetadata(name, sizeof(cfg.device_name) - 1));
+  if (server.hasArg("icon")) copyToBuffer(cfg.device_icon, sizeof(cfg.device_icon), sanitizeIconKey(icon));
+  if (server.hasArg("floor")) copyToBuffer(cfg.device_floor, sizeof(cfg.device_floor), sanitizeMetadata(floor, sizeof(cfg.device_floor) - 1));
   saveConfig();
   server.send(200, "application/json", "{\"ok\":true,\"msg\":\"rebooting\"}");
   delay(500);
@@ -920,6 +1263,10 @@ void handleForceMode() {
     server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid_mode\"}");
     return;
   }
+  if (newMode == FORCE_MODE_HOME && strlen(cfg.sta_ssid) == 0) {
+    server.send(400, "application/json", "{\"ok\":false,\"error\":\"missing_sta_config\"}");
+    return;
+  }
   cfg.force_mode = newMode;
   saveConfig();
   server.send(200, "application/json", "{\"ok\":true,\"msg\":\"rebooting\"}");
@@ -938,39 +1285,78 @@ void handleMasterUdpReceive() {
   IPAddress remoteIp = udp.remoteIP();
 
   if (msg.startsWith("HELLO:")) {
-    int p1 = msg.indexOf(':', 6);
-    int p2 = msg.indexOf(':', p1 + 1);
-    int p3 = msg.indexOf(':', p2 + 1);
-    String mac = (p1 > 0) ? msg.substring(6, p1) : msg.substring(5);
-    mac.trim();
-    String name = (p1 > 0 && p2 > 0) ? msg.substring(p1 + 1, p2) : "";
-    String icon = (p2 > 0 && p3 > 0) ? msg.substring(p2 + 1, p3) : "ac";
-    String floor = (p3 > 0) ? msg.substring(p3 + 1) : "";
-    name.trim(); icon.trim(); floor.trim();
-
-    bool alreadyKnown = false;
-    int slot = -1;
-    for (int i = 0; i < MAX_SLAVES; i++) {
-      if (strcmp(slaves[i].mac, mac.c_str()) == 0) { alreadyKnown = true; slot = i; break; }
-    }
-    if (!alreadyKnown && pairingMode) {
-      for (int i = 0; i < MAX_SLAVES; i++) {
-        if (slaves[i].mac[0] == '\0') { slot = i; break; }
+    // 格式: HELLO:<mac>:<name>:<icon>:<floor>
+    // MAC 是固定 17 字节 ("AA:BB:CC:DD:EE:FF")，内部含 5 个冒号，
+    // 不能用 indexOf(':') 定位字段分隔符——会命中 MAC 内部的冒号。
+    const int MAC_LEN = 17;
+    const int HDR_LEN = 6;  // "HELLO:"
+    String mac = "";
+    String name = "";
+    String icon = "ac";
+    String floor = "";
+    if (msg.length() >= HDR_LEN + MAC_LEN) {
+      mac = msg.substring(HDR_LEN, HDR_LEN + MAC_LEN);
+      mac.trim();
+      // MAC 后的分隔符位置
+      int fieldStart = HDR_LEN + MAC_LEN;
+      if (fieldStart < (int)msg.length() && msg.charAt(fieldStart) == ':') fieldStart++;
+      // 剩余 "name:icon:floor" 按 ':' 切分（允许 name 为空，如 "::ac:floor"）
+      String rest = msg.substring(fieldStart);
+      int c1 = rest.indexOf(':');
+      if (c1 >= 0) {
+        name = rest.substring(0, c1);
+        int c2 = rest.indexOf(':', c1 + 1);
+        if (c2 >= 0) {
+          icon = rest.substring(c1 + 1, c2);
+          floor = rest.substring(c2 + 1);
+        } else {
+          icon = rest.substring(c1 + 1);
+        }
+      } else {
+        name = rest;
       }
+      name = sanitizeMetadata(name, sizeof(slaves[0].name) - 1);
+      icon = sanitizeIconKey(icon);
+      floor = sanitizeMetadata(floor, sizeof(slaves[0].floor) - 1);
     }
-    if (slot >= 0) {
-      strncpy(slaves[slot].mac, mac.c_str(), 17);
-      slaves[slot].mac[17] = '\0';
+    if (!isValidMacString(mac)) {
+      Serial.printf("[MASTER] Ignoring malformed HELLO: %s\n", msg.substring(0, 80).c_str());
+      return;
+    }
+
+    int slot = findSlaveSlotByMac(mac.c_str());
+    bool alreadyKnown = (slot >= 0);
+    if (!alreadyKnown && pairingMode) {
+      slot = findFreeSlaveSlot();
+    }
+    bool accepted = (slot >= 0);
+    if (accepted) {
+      bool changed = !alreadyKnown;
+      copyToBuffer(slaves[slot].mac, sizeof(slaves[slot].mac), mac);
       slaves[slot].ip = remoteIp;
       slaves[slot].lastSeen = millis();
-      if (name.length() > 0) { strncpy(slaves[slot].name, name.c_str(), 32); slaves[slot].name[32] = '\0'; }
-      if (icon.length() > 0) { strncpy(slaves[slot].icon, icon.c_str(), 11); slaves[slot].icon[11] = '\0'; }
-      if (floor.length() > 0) { strncpy(slaves[slot].floor, floor.c_str(), 32); slaves[slot].floor[32] = '\0'; }
+      if (name.length() > 0 && strcmp(slaves[slot].name, name.c_str()) != 0) {
+        copyToBuffer(slaves[slot].name, sizeof(slaves[slot].name), name);
+        changed = true;
+      }
+      if (icon.length() > 0 && strcmp(slaves[slot].icon, icon.c_str()) != 0) {
+        copyToBuffer(slaves[slot].icon, sizeof(slaves[slot].icon), icon);
+        changed = true;
+      }
+      if (floor.length() > 0 && strcmp(slaves[slot].floor, floor.c_str()) != 0) {
+        copyToBuffer(slaves[slot].floor, sizeof(slaves[slot].floor), floor);
+        changed = true;
+      }
+      if (changed) savePairedSlaves();
     }
 
-    udp.beginPacket(remoteIp, UDP_PORT);
-    udp.print("ACK:");
-    udp.endPacket();
+    if (accepted) {
+      udp.beginPacket(remoteIp, UDP_PORT);
+      udp.print("ACK:");
+      udp.endPacket();
+    } else {
+      Serial.printf("[MASTER] Ignoring unpaired slave %s\n", mac.c_str());
+    }
   } else if (msg.startsWith("CONFIGACK:")) {
     Serial.printf("[MASTER] CONFIGACK: %s\n", msg.substring(10).c_str());
   }
@@ -988,19 +1374,25 @@ void handleMqttConfig() {
     return;
   }
   // POST: 保存 MQTT 配置
-  String host = server.arg("host");
-  strncpy(cfg.mqtt_host, host.c_str(), sizeof(cfg.mqtt_host) - 1);
-  cfg.mqtt_host[sizeof(cfg.mqtt_host) - 1] = '\0';
-  String port = server.arg("port");
-  if (port.length() > 0) cfg.mqtt_port = port.toInt();
-  String user = server.arg("user");
-  strncpy(cfg.mqtt_user, user.c_str(), sizeof(cfg.mqtt_user) - 1);
-  cfg.mqtt_user[sizeof(cfg.mqtt_user) - 1] = '\0';
-  String pass = server.arg("pass");
-  if (pass.length() > 0) strncpy(cfg.mqtt_pass, pass.c_str(), sizeof(cfg.mqtt_pass) - 1);
-  cfg.mqtt_pass[sizeof(cfg.mqtt_pass) - 1] = '\0';
-  String topic = server.arg("topic");
-  if (topic.length() > 0) { strncpy(cfg.mqtt_topic, topic.c_str(), sizeof(cfg.mqtt_topic) - 1); cfg.mqtt_topic[sizeof(cfg.mqtt_topic) - 1] = '\0'; }
+  String host = sanitizeConfigValue(server.arg("host"), sizeof(cfg.mqtt_host) - 1);
+  copyToBuffer(cfg.mqtt_host, sizeof(cfg.mqtt_host), host);
+  String port = sanitizeConfigValue(server.arg("port"), 5);
+  if (port.length() > 0) {
+    long newPort = port.toInt();
+    if (newPort < 1 || newPort > 65535) {
+      server.send(400, "application/json", "{\"ok\":false,\"error\":\"invalid_port\"}");
+      return;
+    }
+    cfg.mqtt_port = (uint16_t)newPort;
+  }
+  String user = sanitizeConfigValue(server.arg("user"), sizeof(cfg.mqtt_user) - 1);
+  copyToBuffer(cfg.mqtt_user, sizeof(cfg.mqtt_user), user);
+  if (server.hasArg("pass")) {
+    String pass = sanitizeConfigValue(server.arg("pass"), sizeof(cfg.mqtt_pass) - 1);
+    copyToBuffer(cfg.mqtt_pass, sizeof(cfg.mqtt_pass), pass);
+  }
+  String topic = sanitizeConfigValue(server.arg("topic"), sizeof(cfg.mqtt_topic) - 1);
+  if (topic.length() > 0) copyToBuffer(cfg.mqtt_topic, sizeof(cfg.mqtt_topic), topic);
   saveConfig();
   server.send(200, "application/json", "{\"ok\":true,\"msg\":\"rebooting\"}");
   delay(500);
@@ -1017,7 +1409,26 @@ void handleSensorStatus() {
   server.send(200, "application/json", json);
 }
 
+void initSensors() {
+  if (sensorsInitialized) return;
+  sensorsInitialized = true;
+
+  pinMode(SENSOR_PIR, INPUT);
+  pirDetected = (digitalRead(SENSOR_PIR) == HIGH);
+
+  dallas.begin();
+  sensorPresent = (dallas.getDeviceCount() > 0);
+  if (sensorPresent) {
+    dallas.setResolution(12);
+    dallas.requestTemperatures();
+    Serial.printf("[SENSOR] DS18B20 found, count=%d\n", dallas.getDeviceCount());
+  } else {
+    Serial.println("[SENSOR] No DS18B20 detected");
+  }
+}
+
 void updateSensors() {
+  initSensors();
   unsigned long now = millis();
   if (now - lastSensorRead < SENSOR_INTERVAL) return;
   lastSensorRead = now;
@@ -1034,44 +1445,100 @@ void updateSensors() {
 }
 
 // ===== OTA 双分区上传处理 =====
+void otaReject(const char* reason) {
+    otaWriteOk = false;
+    strncpy(otaRejectReason, reason, sizeof(otaRejectReason) - 1);
+    otaRejectReason[sizeof(otaRejectReason) - 1] = '\0';
+    Serial.printf("[OTA] Reject: %s\n", otaRejectReason);
+}
+
+uint32_t readLe32(const uint8_t* p) {
+    return (uint32_t)p[0] |
+           ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) |
+           ((uint32_t)p[3] << 24);
+}
+
+bool otaImageHeaderValid(const uint8_t* data, size_t len) {
+    if (!data || len < 16) {
+        otaReject("image header too short");
+        return false;
+    }
+
+    if (data[0] != 0xE9) {
+        otaReject("invalid ESP8266 image magic");
+        return false;
+    }
+
+    uint8_t segmentCount = data[1];
+    uint8_t flashMode = data[2];
+    uint32_t firstSection = readLe32(data + 8);
+    if (segmentCount < 3 || segmentCount > 16 || firstSection != OTA_APP_FIRST_SECTION) {
+        otaReject("upload stripped OTA app image: firmware-rom0/rom1-*.bin or flash_images/rom0.bin/rom1.bin");
+        return false;
+    }
+    if (flashMode != OTA_FLASH_MODE_DOUT) {
+        otaReject("invalid flash mode; this board requires DOUT images");
+        return false;
+    }
+
+    return true;
+}
+
 void otaUploadHandler() {
     HTTPUpload& upload = server.upload();
     if (upload.status == UPLOAD_FILE_START) {
-        if (!server.authenticate("admin", "12345678")) {
+        if (!server.authenticate("admin", getApPass())) {
             otaWriteOk = false;
             return;
         }
         otaUploadSize = 0;
         otaAccLen = 0;
         otaWriteOk = true;
+        otaHeaderChecked = false;
+        otaRejectReason[0] = '\0';
         uint8_t target = rboot_get_target_rom();
         otaTargetAddr = rboot_get_rom_address(target);
+        if (otaTargetAddr == 0) {
+            otaReject("invalid OTA target partition");
+            return;
+        }
         Serial.printf("[OTA] Start ROM %d at 0x%06X\n", target, otaTargetAddr);
     } else if (upload.status == UPLOAD_FILE_WRITE && otaWriteOk) {
         // 防御: 固件大小不能超过 ROM slot (~1016KB = 0xFE000)
-        if (otaUploadSize + otaAccLen + upload.currentSize > 0xFE000) {
+        if (otaUploadSize + otaAccLen + upload.currentSize > OTA_SLOT_MAX_SIZE) {
             Serial.printf("[OTA] FIRMWARE TOO LARGE: %d + %d bytes\n",
                           otaUploadSize + otaAccLen, upload.currentSize);
-            otaWriteOk = false;
+            otaReject("firmware image is too large for OTA slot");
             return;
         }
-        size_t space = sizeof(otaAccBuf) - otaAccLen;
-        size_t copy = (upload.currentSize < space) ? upload.currentSize : space;
-        memcpy(otaAccBuf + otaAccLen, upload.buf, copy);
-        otaAccLen += copy;
-        if (otaAccLen >= sizeof(otaAccBuf)) {
-            otaWriteOk = rboot_write_flash(otaTargetAddr + otaUploadSize,
-                                           otaAccBuf, otaAccLen);
-            otaUploadSize += otaAccLen;
-            otaAccLen = 0;
-        }
-        // 处理剩余数据
-        if (copy < upload.currentSize && otaWriteOk) {
-            size_t remain = upload.currentSize - copy;
-            memcpy(otaAccBuf, upload.buf + copy, remain);
-            otaAccLen = remain;
+
+        size_t inPos = 0;
+        while (inPos < upload.currentSize && otaWriteOk) {
+            size_t space = sizeof(otaAccBuf) - otaAccLen;
+            size_t remaining = upload.currentSize - inPos;
+            size_t copy = (remaining < space) ? remaining : space;
+            memcpy(otaAccBuf + otaAccLen, upload.buf + inPos, copy);
+            otaAccLen += copy;
+            inPos += copy;
+
+            if (!otaHeaderChecked && otaAccLen >= 16) {
+                otaHeaderChecked = true;
+                if (!otaImageHeaderValid(otaAccBuf, otaAccLen)) return;
+            }
+
+            if (otaAccLen >= sizeof(otaAccBuf)) {
+                otaWriteOk = rboot_write_flash(otaTargetAddr + otaUploadSize,
+                                               otaAccBuf, otaAccLen);
+                otaUploadSize += otaAccLen;
+                otaAccLen = 0;
+            }
         }
     } else if (upload.status == UPLOAD_FILE_END) {
+        if (!otaHeaderChecked && otaWriteOk) {
+            otaHeaderChecked = true;
+            otaImageHeaderValid(otaAccBuf, otaAccLen);
+        }
         // 刷写最后一块
         if (otaAccLen > 0 && otaWriteOk) {
             otaWriteOk = rboot_write_flash(otaTargetAddr + otaUploadSize,
@@ -1085,11 +1552,16 @@ void otaUploadHandler() {
 }
 
 void otaFinishHandler() {
-    if (!server.authenticate("admin", "12345678")) {
+    if (!server.authenticate("admin", getApPass())) {
         return server.requestAuthentication();
     }
     if (!otaWriteOk || otaUploadSize == 0) {
-        server.send(500, "text/plain", "OTA write failed");
+        String msg = "OTA write failed";
+        if (strlen(otaRejectReason) > 0) {
+            msg += ": ";
+            msg += otaRejectReason;
+        }
+        server.send(500, "text/plain", msg);
         return;
     }
 
@@ -1100,7 +1572,16 @@ void otaFinishHandler() {
     otaState.timestamp = millis();
 
     File f = LittleFS.open("/ota_state.bin", "w");
-    if (f) { f.write((uint8_t*)&otaState, sizeof(otaState)); f.close(); }
+    if (!f) {
+        server.send(500, "text/plain", "OTA state write failed");
+        return;
+    }
+    size_t written = f.write((uint8_t*)&otaState, sizeof(otaState));
+    f.close();
+    if (written != sizeof(otaState)) {
+        server.send(500, "text/plain", "OTA state write incomplete");
+        return;
+    }
 
     uint8_t target = rboot_get_target_rom();
     Serial.printf("[OTA] Switching to ROM %d, rebooting...\n", target);
@@ -1111,15 +1592,22 @@ void otaFinishHandler() {
 
 void handleOTAStatus() {
     uint8_t cur = rboot_get_current_rom();
+    uint8_t target = rboot_get_target_rom();
     rboot_config conf = rboot_get_config();
     String json = "{\"ok\":true,\"current_rom\":";
     json += String(cur);
+    json += ",\"target_rom\":";
+    json += String(target);
     json += ",\"rom0_addr\":\"0x";
     json += String(conf.roms[0], HEX);
     json += "\",\"rom1_addr\":\"0x";
     json += String(conf.roms[1], HEX);
+    json += "\",\"target_addr\":\"0x";
+    json += String(rboot_get_rom_address(target), HEX);
     json += "\",\"ota_pending\":";
     json += otaState.pending ? "true" : "false";
+    json += ",\"slot_max\":";
+    json += String(OTA_SLOT_MAX_SIZE);
     json += ",\"sketch_size\":";
     json += String(ESP.getSketchSize());
     json += ",\"free_space\":";
@@ -1149,18 +1637,72 @@ void clearOTAState() {
     if (f) { f.write((uint8_t*)&otaState, sizeof(otaState)); f.close(); }
 }
 
+bool rollbackPendingOTA(const char* reason) {
+#if !IRAC_RBOOT_OTA
+    (void)reason;
+    return false;
+#endif
+    loadOTAState();
+    if (!otaState.pending) return false;
+    Serial.printf("[OTA] Rollback: %s\n", reason);
+    uint8_t prev = otaState.previous_rom;
+    clearOTAState();
+    LittleFS.remove("/ota_boots.txt");
+    rboot_set_current_rom(prev);
+    delay(100);
+    ESP.restart();
+    return true;
+}
+
 void checkOTARollback() {
+#if !IRAC_RBOOT_OTA
+    otaState = {OTA_STATE_MAGIC, OTA_STATE_VERSION, false, 0, 0};
+    otaConfirmAt = 0;
+    return;
+#endif
     loadOTAState();
     if (!otaState.pending) return;
 
     Serial.println("[OTA] Pending update detected, health check...");
 
-    // 检查 1: LittleFS 能挂载（已挂载）
-    // 检查 2: 能执行到这里说明代码在运行
-    bool healthy = true;
+    struct rst_info *rst = ESP.getResetInfoPtr();
+    bool isCrash = (rst && (rst->reason == REASON_WDT_RST ||
+                            rst->reason == REASON_EXCEPTION_RST ||
+                            rst->reason == REASON_SOFT_WDT_RST));
+    uint8_t otaBoots = 0;
+    if (isCrash) {
+      File bf = LittleFS.open("/ota_boots.txt", "r");
+      if (bf) { otaBoots = (uint8_t)bf.parseInt(); bf.close(); }
+      otaBoots++;
+      bf = LittleFS.open("/ota_boots.txt", "w");
+      if (bf) { bf.println(otaBoots); bf.close(); }
+      Serial.printf("[OTA] Crash boot #%d since OTA (max %d)\n", otaBoots, OTA_MAX_CRASH_BOOTS);
+    } else {
+      Serial.printf("[OTA] Clean reset, crash counter unchanged\n");
+    }
 
-    // STA Home 模式额外检查 WiFi
-    if (deviceMode == MODE_STA_HOME) {
+    if (otaBoots > OTA_MAX_CRASH_BOOTS) {
+        uint8_t prev = otaState.previous_rom;
+        Serial.printf("[OTA] Too many crash boots, rolling back to ROM %d\n", prev);
+        clearOTAState();
+        LittleFS.remove("/ota_boots.txt");
+        rboot_set_current_rom(prev);
+        delay(100);
+        ESP.restart();
+    }
+
+    if (ESP.getFreeHeap() < 5000) {
+        Serial.printf("[OTA] Critical low heap: %u, rollback!\n", ESP.getFreeHeap());
+        uint8_t prev = otaState.previous_rom;
+        clearOTAState();
+        LittleFS.remove("/ota_boots.txt");
+        rboot_set_current_rom(prev);
+        delay(100);
+        ESP.restart();
+    }
+
+    bool healthy = true;
+    if (deviceMode == MODE_STA_HOME || deviceMode == MODE_STA_SLAVE) {
         int wifiWait = 0;
         while (WiFi.status() != WL_CONNECTED && wifiWait < 20) {
             delay(500);
@@ -1170,24 +1712,53 @@ void checkOTARollback() {
             Serial.println("[OTA] WiFi failed, rollback!");
             healthy = false;
         }
+    } else if (deviceMode == MODE_AP_MASTER) {
+        if (!masterApStarted || WiFi.softAPIP() == IPAddress(0, 0, 0, 0)) {
+            Serial.println("[OTA] AP failed to start, rollback!");
+            healthy = false;
+        }
     }
 
     if (healthy) {
-        Serial.println("[OTA] Health check passed, update confirmed");
-        clearOTAState();
+        Serial.printf("[OTA] Basic check passed, will confirm after %ds stable run\n", OTA_CONFIRM_DELAY_MS / 1000);
+        otaConfirmAt = millis() + OTA_CONFIRM_DELAY_MS;
     } else {
         uint8_t prev = otaState.previous_rom;
         Serial.printf("[OTA] Rolling back to ROM %d\n", prev);
         clearOTAState();
+        LittleFS.remove("/ota_boots.txt");
         rboot_set_current_rom(prev);
         delay(100);
         ESP.restart();
     }
 }
 
+void confirmOTAIfReady() {
+    if (otaConfirmAt == 0 || !otaState.pending) return;
+    if (millis() < otaConfirmAt) return;
+
+    Serial.println("[OTA] Stable run reached, update confirmed");
+    clearOTAState();
+    LittleFS.remove("/ota_boots.txt");
+    otaConfirmAt = 0;
+}
+
 void registerApiRoutes() {
+#if IRAC_RBOOT_OTA
   server.on("/update", HTTP_POST, otaFinishHandler, otaUploadHandler);
   server.on("/api/ota/status", HTTP_GET, handleOTAStatus);
+#else
+  server.on("/update", HTTP_POST, []() {
+    server.send(503, "text/plain", "rboot OTA is disabled in factory firmware");
+  }, []() {
+    HTTPUpload& upload = server.upload();
+    (void)upload;
+  });
+  server.on("/api/ota/status", HTTP_GET, []() {
+    server.send(200, "application/json",
+                "{\"ok\":true,\"ota_supported\":false,\"mode\":\"factory\"}");
+  });
+#endif
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/hvac", HTTP_POST, handleHvac);
   server.on("/api/send", HTTP_POST, handleSend);
@@ -1227,20 +1798,33 @@ void mqttPublishState() {
     mqtt.publish((base + "/current_temperature").c_str(), String(roomTempC, 1).c_str(), true);
   }
   mqtt.publish((base + "/motion").c_str(), pirDetected ? "ON" : "OFF", true);
+
+  String action = "off";
+  if (currentPower) {
+    if (currentMode == "Cool") action = "cooling";
+    else if (currentMode == "Heat") action = "heating";
+    else if (currentMode == "Dry") action = "drying";
+    else if (currentMode == "Fan") action = "fan";
+    else action = "idle";
+  }
+  mqtt.publish((base + "/action").c_str(), action.c_str(), true);
 }
 
 void mqttPublishDiscovery() {
   String base = mqttTopicBase();
+  String chipId = String(ESP.getChipId(), HEX);
+  String devName = strlen(cfg.device_name) > 0 ? jsonEscape(String(cfg.device_name)) : String("IR AC");
   String disc = String()
     + "{"
-    + "\"name\":\"IR AC\","
-    + "\"unique_id\":\"ir-ac-" + String(ESP.getChipId(), HEX) + "\","
+    + "\"name\":\"" + devName + "\","
+    + "\"unique_id\":\"ir-ac-" + chipId + "\","
     + "\"icon\":\"mdi:air-conditioner\","
     + "\"availability_topic\":\"" + base + "/availability\","
     + "\"payload_available\":\"online\","
     + "\"payload_not_available\":\"offline\","
     + "\"mode_command_topic\":\"" + base + "/mode/set\","
     + "\"mode_state_topic\":\"" + base + "/mode_state\","
+    + "\"action_topic\":\"" + base + "/action\","
     + "\"modes\":[\"off\",\"cool\",\"heat\",\"fan_only\",\"dry\",\"auto\"],"
     + "\"temperature_command_topic\":\"" + base + "/temperature/set\","
     + "\"temperature_state_topic\":\"" + base + "/temperature_state\","
@@ -1251,20 +1835,20 @@ void mqttPublishDiscovery() {
     + "\"current_temperature_topic\":\"" + base + "/current_temperature\","
     + "\"precision\":1.0,"
     + "\"device\":{"
-        + "\"identifiers\":[\"ir-ac-" + String(ESP.getChipId(), HEX) + "\"],"
-        + "\"name\":\"IR AC\","
+        + "\"identifiers\":[\"ir-ac-" + chipId + "\"],"
+        + "\"name\":\"" + devName + "\","
         + "\"manufacturer\":\"DIY\","
         + "\"model\":\"IR Mini V105\","
         + "\"sw_version\":\"2.0\""
     + "}"
     + "}";
-  mqtt.publish(("homeassistant/climate/ir-ac-" + String(ESP.getChipId(), HEX) + "/config").c_str(),
-                disc.c_str(), true);
+  mqtt.publish(("homeassistant/climate/ir-ac-" + chipId + "/config").c_str(),
+                 disc.c_str(), true);
 
-  String chipId = String(ESP.getChipId(), HEX);
+  String motionName = strlen(cfg.device_name) > 0 ? jsonEscape(String(cfg.device_name)) + " Motion" : String("IR AC Motion");
   String motionDisc = String()
     + "{"
-    + "\"name\":\"IR AC Motion\","
+    + "\"name\":\"" + motionName + "\","
     + "\"unique_id\":\"ir-ac-motion-" + chipId + "\","
     + "\"state_topic\":\"" + base + "/motion\","
     + "\"device_class\":\"motion\","
@@ -1276,49 +1860,54 @@ void mqttPublishDiscovery() {
     + "}"
     + "}";
   mqtt.publish(("homeassistant/binary_sensor/ir-ac-" + chipId + "/config").c_str(),
-                motionDisc.c_str(), true);
+                 motionDisc.c_str(), true);
 
   mqtt.publish((base + "/availability").c_str(), "online", true);
 }
 
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  char pbuf[length + 1];
-  memcpy(pbuf, payload, length);
-  pbuf[length] = '\0';
+  char pbuf[256];
+  unsigned int copyLen = (length < sizeof(pbuf) - 1) ? length : sizeof(pbuf) - 1;
+  memcpy(pbuf, payload, copyLen);
+  pbuf[copyLen] = '\0';
   String t = String(topic);
   String p = String(pbuf);
   Serial.printf("[MQTT] %s -> %s\n", t.c_str(), p.c_str());
 
   String base = mqttTopicBase();
-  String vendor = currentVendor.length() > 0 ? currentVendor : "GREE";
+  String vendor = currentVendor.length() > 0 ? currentVendor
+                : (strlen(cfg.last_vendor) > 0 ? String(cfg.last_vendor) : String("GREE"));
 
   if (t == base + "/mode/set") {
+    bool ok = false;
     if (p == "off") {
-      sendHvacCommand(vendor, false, currentMode, currentTemp, currentFan, "Off");
+      ok = sendHvacCommand(vendor, false, currentMode, currentTemp, currentFan, "Off");
     } else if (p == "cool") {
-      sendHvacCommand(vendor, true, "Cool", currentTemp, currentFan, "Off");
+      ok = sendHvacCommand(vendor, true, "Cool", currentTemp, currentFan, "Off");
     } else if (p == "heat") {
-      sendHvacCommand(vendor, true, "Heat", currentTemp, currentFan, "Off");
+      ok = sendHvacCommand(vendor, true, "Heat", currentTemp, currentFan, "Off");
     } else if (p == "fan_only") {
-      sendHvacCommand(vendor, true, "Fan", currentTemp, currentFan, "Off");
+      ok = sendHvacCommand(vendor, true, "Fan", currentTemp, currentFan, "Off");
     } else if (p == "dry") {
-      sendHvacCommand(vendor, true, "Dry", currentTemp, currentFan, "Off");
+      ok = sendHvacCommand(vendor, true, "Dry", currentTemp, currentFan, "Off");
     } else if (p == "auto") {
-      sendHvacCommand(vendor, true, "Auto", currentTemp, currentFan, "Off");
+      ok = sendHvacCommand(vendor, true, "Auto", currentTemp, currentFan, "Off");
     }
-    mqttPublishState();
+    if (ok) mqttPublishState();
   } else if (t == base + "/temperature/set") {
-    currentTemp = p.toInt();
-    currentTemp = constrain(currentTemp, 16, 30);
-    sendHvacCommand(vendor, currentPower, currentMode, currentTemp, currentFan, "Off");
-    mqttPublishState();
-  } else if (t == base + "/fan/set") {
-    if (p.length() > 0) {
-      currentFan = p;
-      currentFan[0] = toupper(currentFan[0]);
+    int newTemp = constrain(p.toInt(), 16, 30);
+    if (sendHvacCommand(vendor, currentPower, currentMode, newTemp, currentFan, "Off")) {
+      mqttPublishState();
     }
-    sendHvacCommand(vendor, currentPower, currentMode, currentTemp, currentFan, "Off");
-    mqttPublishState();
+  } else if (t == base + "/fan/set") {
+    String newFan = currentFan;
+    if (p.length() > 0) {
+      newFan = p;
+      newFan[0] = toupper(newFan[0]);
+    }
+    if (sendHvacCommand(vendor, currentPower, currentMode, currentTemp, newFan, "Off")) {
+      mqttPublishState();
+    }
   }
 }
 
@@ -1339,7 +1928,6 @@ bool mqttConnect() {
 
   if (ok) {
     Serial.println("[MQTT] Connected");
-    mqttEnabled = true;
     String base = mqttTopicBase();
     mqtt.subscribe((base + "/mode/set").c_str());
     mqtt.subscribe((base + "/temperature/set").c_str());
@@ -1354,7 +1942,7 @@ bool mqttConnect() {
 
 // ===== 从机逻辑 =====
 void slaveExecRaw(String data) {
-  uint16_t buf[512];
+  static uint16_t buf[512];  // 1KB — 改 static 避免栈爆（slaveExecRaw 不重入）
   int len = parseRaw(data, buf, 512);
   if (len == 0) return;
 
@@ -1369,23 +1957,74 @@ void slaveExecRaw(String data) {
 }
 
 void slaveExecHvac(String data) {
-  int p[6], pi = 0;
-  for (int i = 0; i < (int)data.length() && pi < 6; ) {
-    int comma = data.indexOf(',', i);
-    if (comma < 0) { p[pi++] = i; break; }
-    p[pi++] = i;
-    i = comma + 1;
-  }
+  // 格式: vendor,power,mode,temp,fan,swing  (power 为 "0"/"1")
+  int c1 = data.indexOf(',');
+  if (c1 < 0) return;
+  String vendor = data.substring(0, c1);
 
-  String vendor = (pi > 0) ? data.substring(p[0], data.indexOf(',', p[0])) : "";
-  bool power = (pi > 1) ? data.charAt(data.indexOf(',', p[0]) + 1) == '1' : false;
-  String mode = (pi > 2) ? data.substring(p[2], data.indexOf(',', p[2])) : "Cool";
-  int temp = (pi > 3) ? data.substring(p[3], data.indexOf(',', p[3])).toInt() : 26;
-  String fan = (pi > 4) ? data.substring(p[4], data.indexOf(',', p[4])) : "Auto";
-  String swing = (pi > 5) ? data.substring(p[5]) : "Off";
+  int c2 = data.indexOf(',', c1 + 1);
+  bool power = (c2 > c1) ? data.substring(c1 + 1, c2) == "1" : false;
+  if (c2 < 0) { sendHvacCommand(vendor, power, "Cool", 26, "Auto", "Off"); return; }
+
+  int c3 = data.indexOf(',', c2 + 1);
+  String mode = (c3 >= 0) ? data.substring(c2 + 1, c3) : data.substring(c2 + 1);
+  if (mode.length() == 0) mode = "Cool";
+  if (c3 < 0) { sendHvacCommand(vendor, power, mode, 26, "Auto", "Off"); return; }
+
+  int c4 = data.indexOf(',', c3 + 1);
+  String tempStr = (c4 >= 0) ? data.substring(c3 + 1, c4) : data.substring(c3 + 1);
+  int temp = tempStr.toInt();
+  if (temp == 0) temp = 26;
+  if (c4 < 0) { sendHvacCommand(vendor, power, mode, temp, "Auto", "Off"); return; }
+
+  int c5 = data.indexOf(',', c4 + 1);
+  String fan = (c5 >= 0) ? data.substring(c4 + 1, c5) : data.substring(c4 + 1);
+  if (fan.length() == 0) fan = "Auto";
+  String swing = (c5 >= 0) ? data.substring(c5 + 1) : "Off";
 
   sendHvacCommand(vendor, power, mode, temp, fan, swing);
   Serial.printf("[SLAVE] %s %s %dC\n", vendor.c_str(), power ? "ON" : "OFF", temp);
+}
+
+bool applyOfficePresetFromButton() {
+  bool power = !currentPower;
+  String vendor = OFFICE_PRESET_VENDOR;
+  String mode = OFFICE_PRESET_MODE;
+  String fan = OFFICE_PRESET_FAN;
+  String swing = OFFICE_PRESET_SWING;
+  int temp = OFFICE_PRESET_TEMP;
+
+  Serial.printf("[BTN] Office preset: %s %s %dC fan=%s\n",
+                vendor.c_str(), power ? "ON" : "OFF", temp, fan.c_str());
+  bool ok = sendHvacCommand(vendor, power, mode, temp, fan, swing);
+  if (!ok) {
+    Serial.println("[BTN] Office preset failed");
+    blinkLedRestore(LED_RED, 3, 80, 80);
+    return false;
+  }
+
+  copyToBuffer(cfg.last_vendor, sizeof(cfg.last_vendor), vendor);
+  copyToBuffer(cfg.last_mode, sizeof(cfg.last_mode), mode);
+  cfg.last_temp = (uint8_t)temp;
+  copyToBuffer(cfg.last_fan, sizeof(cfg.last_fan), fan);
+  cfg.last_power = power;
+  saveConfig();
+
+  if (deviceMode == MODE_AP_MASTER) {
+    char msg[128];
+    snprintf(msg, sizeof(msg), "HVAC:ALL:%s,%s,%s,%d,%s,%s",
+             vendor.c_str(), power ? "1" : "0", mode.c_str(), temp,
+             fan.c_str(), swing.c_str());
+    broadcastUdp(msg);
+  }
+
+  if (mqttEnabled && mqtt.connected()) {
+    mqttPublishState();
+  }
+
+  if (power) blinkLedRestore(LED_BLUE, 2, 80, 80);
+  else blinkLedRestore(LED_YELLOW, 2, 80, 80);
+  return true;
 }
 
 void checkButton() {
@@ -1402,18 +2041,23 @@ void checkButton() {
   if (btnState == LOW) {
     if (!btnPressed) {
       btnPressed = true;
+      btnLongHandled = false;
       btnPressStart = millis();
       Serial.println("[BTN] Pressed");
     } else {
       unsigned long elapsed = millis() - btnPressStart;
-      if (elapsed >= BTN_LONG_PRESS_MS) {
+      if (elapsed >= BTN_LONG_PRESS_MS && !btnLongHandled) {
+        btnLongHandled = true;
         Serial.println("[BTN] Long press → factory reset!");
         for (int i = 0; i < 10; i++) {
           LED_ON(LED_YELLOW); delay(50);
           LED_OFF(LED_YELLOW); delay(50);
         }
         LittleFS.remove("/config.txt");
+        LittleFS.remove("/config.bak");
         LittleFS.remove("/ota_state.bin");
+        LittleFS.remove(SLAVES_FILE);
+        LittleFS.remove("/slaves.bak");
         ESP.restart();
       } else if (elapsed >= 2000) {
         if ((millis() / 200) % 2 == 0) LED_ON(LED_YELLOW);
@@ -1421,7 +2065,17 @@ void checkButton() {
       }
     }
   } else {
+    if (btnPressed) {
+      unsigned long elapsed = millis() - btnPressStart;
+      if (!btnLongHandled && elapsed >= BTN_SHORT_PRESS_MIN_MS &&
+          elapsed <= BTN_SHORT_PRESS_MAX_MS) {
+        applyOfficePresetFromButton();
+      } else if (!btnLongHandled && elapsed > BTN_SHORT_PRESS_MAX_MS) {
+        Serial.println("[BTN] Release ignored (hold too long for shortcut)");
+      }
+    }
     btnPressed = false;
+    btnLongHandled = false;
   }
 }
 
@@ -1438,7 +2092,7 @@ void slaveLoop() {
   if (!packetSize) goto slaveCheckWifi;
 
   {
-  char buf[1024];
+  static char buf[1024];  // 改 static 避免栈爆（slaveLoop 不重入）
   int len = udp.read(buf, sizeof(buf) - 1);
   if (len <= 0) goto slaveCheckWifi;
   buf[len] = '\0';
@@ -1472,34 +2126,26 @@ void slaveLoop() {
       if (target == mySlaveId()) {
         IPAddress masterIp = udp.remoteIP();
         String ack = "CONFIGACK:" + mySlaveId() + ":";
+        bool doReboot = false;
+        bool doDisconnect = false;
         int eq = cmd.indexOf('=');
         if (eq > 0) {
           String key = cmd.substring(0, eq);
           String val = cmd.substring(eq + 1);
-          if (key == "name") { strncpy(cfg.device_name, val.c_str(), 32); cfg.device_name[32] = '\0'; }
-          else if (key == "icon") { strncpy(cfg.device_icon, val.c_str(), 11); cfg.device_icon[11] = '\0'; }
-          else if (key == "floor") { strncpy(cfg.device_floor, val.c_str(), 32); cfg.device_floor[32] = '\0'; }
-          else if (key == "ap_ssid") { strncpy(cfg.ap_ssid, val.c_str(), 32); cfg.ap_ssid[32] = '\0'; }
-          else if (key == "ap_pass") { strncpy(cfg.ap_pass, val.c_str(), 32); cfg.ap_pass[32] = '\0'; }
-          saveConfig();
-          ack += "ok";
+          bool keyOk = true;
+          if (key == "name") copyToBuffer(cfg.device_name, sizeof(cfg.device_name), sanitizeMetadata(val, sizeof(cfg.device_name) - 1));
+          else if (key == "icon") copyToBuffer(cfg.device_icon, sizeof(cfg.device_icon), sanitizeIconKey(val));
+          else if (key == "floor") copyToBuffer(cfg.device_floor, sizeof(cfg.device_floor), sanitizeMetadata(val, sizeof(cfg.device_floor) - 1));
+          else if (key == "ap_ssid") copyToBuffer(cfg.ap_ssid, sizeof(cfg.ap_ssid), sanitizeConfigValue(val, sizeof(cfg.ap_ssid) - 1));
+          else if (key == "ap_pass") copyToBuffer(cfg.ap_pass, sizeof(cfg.ap_pass), sanitizeConfigValue(val, sizeof(cfg.ap_pass) - 1));
+          else { ack += "unknown_key"; keyOk = false; }
+          if (keyOk) { saveConfig(); ack += "ok"; }
         } else if (cmd == "reboot") {
           ack += "ok";
-          udp.beginPacket(masterIp, UDP_PORT);
-          udp.print(ack);
-          udp.endPacket();
-          delay(100);
-          ESP.restart();
+          doReboot = true;
         } else if (cmd == "disconnect") {
           ack += "ok";
-          udp.beginPacket(masterIp, UDP_PORT);
-          udp.print(ack);
-          udp.endPacket();
-          delay(100);
-          WiFi.disconnect();
-          deviceMode = MODE_AP_MASTER;
-          delay(500);
-          ESP.restart();
+          doDisconnect = true;
         } else {
           ack += "unknown_cmd";
         }
@@ -1507,13 +2153,25 @@ void slaveLoop() {
         udp.print(ack);
         udp.endPacket();
         Serial.printf("[SLAVE] CONFIG %s → %s\n", cmd.c_str(), ack.substring(ack.lastIndexOf(':') + 1).c_str());
+        if (doDisconnect) {
+          delay(100);
+          cfg.force_mode = FORCE_MODE_AP;
+          cfg.paired_master_bssid[0] = '\0';
+          saveConfig();
+          WiFi.disconnect();
+          delay(500);
+          ESP.restart();
+        }
+        if (doReboot) {
+          delay(100);
+          ESP.restart();
+        }
       }
     }
   } else if (msg.startsWith("ACK:")) {
     String bssid = WiFi.BSSIDstr();
     if (bssid.length() > 0 && strcmp(cfg.paired_master_bssid, bssid.c_str()) != 0) {
-      strncpy(cfg.paired_master_bssid, bssid.c_str(), sizeof(cfg.paired_master_bssid) - 1);
-      cfg.paired_master_bssid[sizeof(cfg.paired_master_bssid) - 1] = '\0';
+      copyToBuffer(cfg.paired_master_bssid, sizeof(cfg.paired_master_bssid), bssid);
       saveConfig();
       Serial.printf("[SLAVE] Paired with master BSSID: %s\n", bssid.c_str());
     }
@@ -1544,47 +2202,65 @@ void setup() {
   LED_OFF(LED_BLUE);
   LED_OFF(LED_RED);
   LED_OFF(LED_YELLOW);
+  bootLedSelfTest();
+  LED_ON(LED_BLUE);  // 应用已进入 setup，后续阶段会继续更新状态灯
 
   wifi_set_sleep_type(NONE_SLEEP_T);
   irSend.begin();
 
-  pinMode(SENSOR_PIR, INPUT);
-  dallas.begin();
-  sensorPresent = (dallas.getDeviceCount() > 0);
-  if (sensorPresent) {
-    dallas.setResolution(12);
-    dallas.requestTemperatures();
-    Serial.printf("[SENSOR] DS18B20 found, count=%d\n", dallas.getDeviceCount());
-  } else {
-    Serial.println("[SENSOR] No DS18B20 detected");
-  }
-
   // ===== 初始化文件系统 =====
+  blinkStatusLed(LED_BLUE, 1, 80, 80);
   if (!LittleFS.begin()) {
     Serial.println("[FS] LittleFS mount failed, formatting...");
+    blinkStatusLed(LED_RED, 2, 120, 120);
     LittleFS.format();
     if (!LittleFS.begin()) {
       Serial.println("[FS] LittleFS still failed after format!");
+      blinkStatusLed(LED_RED, 8, 80, 80);
     }
   }
 
+#if IRAC_RBOOT_OTA
   Serial.printf("[BOOT] ROM %d (rboot dual-partition)\n", rboot_get_current_rom());
+#else
+  Serial.println("[BOOT] factory firmware (direct 0x0, rboot OTA disabled)");
+#endif
 
   // ===== 加载配置 =====
+  blinkStatusLed(LED_YELLOW, 1, 80, 80);
+  bool hasStoredConfig = LittleFS.exists("/config.txt") || LittleFS.exists("/config.bak");
   bool hasSTA = loadConfig();
-  Serial.printf("[BOOT] STA config: %s force_mode=%d\n", hasSTA ? cfg.sta_ssid : "(none)", cfg.force_mode);
+  loadPairedSlaves();
+  mqttEnabled = strlen(cfg.mqtt_host) > 0;
+  currentVendor = strlen(cfg.last_vendor) > 0 ? String(cfg.last_vendor) : String("GREE");
+  currentPower = cfg.last_power;
+  currentMode = strlen(cfg.last_mode) > 0 ? String(cfg.last_mode) : String("Cool");
+  currentTemp = constrain((int)cfg.last_temp, 16, 30);
+  currentFan = strlen(cfg.last_fan) > 0 ? String(cfg.last_fan) : String("Auto");
+  if (cfg.force_mode == FORCE_MODE_HOME && !hasSTA) {
+    Serial.println("[BOOT] force_mode=home without STA config, reverting to auto");
+    cfg.force_mode = FORCE_MODE_AUTO;
+    saveConfig();
+  }
+  Serial.printf("[BOOT] STA config: %s force_mode=%d config=%s\n",
+                hasSTA ? cfg.sta_ssid : "(none)", cfg.force_mode,
+                hasStoredConfig ? "stored" : "fresh");
 
+  // AUTO→优先家庭 WiFi，再扫描主机/开 AP；HOME/AP/SLAVE 为强制模式
   bool skipHome = (cfg.force_mode == FORCE_MODE_AP || cfg.force_mode == FORCE_MODE_SLAVE);
-  bool skipScan = (cfg.force_mode == FORCE_MODE_AP || cfg.force_mode == FORCE_MODE_HOME);
+  bool skipScan = (!hasStoredConfig || cfg.force_mode == FORCE_MODE_AP ||
+                   cfg.force_mode == FORCE_MODE_HOME);
   bool allowMasterFallback = (cfg.force_mode == FORCE_MODE_AUTO || cfg.force_mode == FORCE_MODE_AP);
 
   if (hasSTA && !skipHome) {
     Serial.printf("[STA] Connecting to %s...\n", cfg.sta_ssid);
+    setStatusLeds(true, false, false);
     WiFi.mode(WIFI_STA);
     WiFi.begin(cfg.sta_ssid, cfg.sta_pass);
 
     int attempts = 0;
     while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+      if (attempts % 2 == 0) LED_ON(LED_BLUE); else LED_OFF(LED_BLUE);
       delay(500);
       Serial.print(".");
       attempts++;
@@ -1606,62 +2282,80 @@ void setup() {
         mqttConnect();
       }
 
-      LED_ON(LED_YELLOW);
-      LED_ON(LED_BLUE);
+      setStatusLeds(true, false, true);
       Serial.println("=== STA Home Ready ===");
       return;
     }
     Serial.println("\n[STA] Failed, falling back to AP mode");
+    blinkStatusLed(LED_RED, 1, 120, 80);
   }
-
-  // ===== OTA 健康检查（无 STA 配置或 STA 连接失败） =====
-  checkOTARollback();
 
   if (!skipScan) {
   Serial.println("[BOOT] Scanning WiFi...");
+  setStatusLeds(false, false, true);
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   delay(100);
 
   int n = WiFi.scanNetworks();
-  const char* targetSsid = getApSsid();
   const char* targetPass = getApPass();
+  String targetSsid = "";
+  uint8_t targetBssid[6] = {0};
+  uint8_t pairedBssid[6] = {0};
+  int32_t targetChannel = 0;
+  int bestRssi = -1000;
   bool foundMaster = false;
-  bool targetSsidAllocated = false;
+  bool foundPaired = false;
+  bool targetBssidSet = false;
+  bool hasCustomApSsid = strlen(cfg.ap_ssid) > 0;
+  bool hasPairedBssid = parseMacBytes(cfg.paired_master_bssid, pairedBssid);
+
   for (int i = 0; i < n; i++) {
-    if (WiFi.SSID(i) == targetSsid) {
+    String scanSsid = WiFi.SSID(i);
+    bool ssidMatches = hasCustomApSsid ? (scanSsid == cfg.ap_ssid)
+                                       : (scanSsid == getApSsid());
+    if (!ssidMatches) continue;
+
+    uint8_t* scanBssid = WiFi.BSSID(i);
+    bool bssidMatches = hasPairedBssid && scanBssid &&
+                        memcmp(scanBssid, pairedBssid, sizeof(pairedBssid)) == 0;
+    if (bssidMatches || (!foundPaired && WiFi.RSSI(i) > bestRssi)) {
       foundMaster = true;
-      Serial.printf("[BOOT] Found AP: %s (RSSI: %d)\n", targetSsid, WiFi.RSSI(i));
-      break;
-    }
-  }
-  if (!foundMaster && strlen(cfg.ap_ssid) == 0) {
-    int bestRssi = -1000;
-    String bestSsid = "";
-    for (int i = 0; i < n; i++) {
-      String scanSsid = WiFi.SSID(i);
-      if (scanSsid.startsWith("IR-AC-") && WiFi.RSSI(i) > bestRssi) {
-        bestRssi = WiFi.RSSI(i);
-        bestSsid = scanSsid;
+      foundPaired = bssidMatches;
+      bestRssi = WiFi.RSSI(i);
+      targetSsid = scanSsid;
+      targetChannel = WiFi.channel(i);
+      if (scanBssid) {
+        memcpy(targetBssid, scanBssid, sizeof(targetBssid));
+        targetBssidSet = true;
+      } else {
+        targetBssidSet = false;
       }
-    }
-    if (bestSsid.length() > 0) {
-      foundMaster = true;
-      targetSsid = strdup(bestSsid.c_str());
-      targetSsidAllocated = true;
-      Serial.printf("[BOOT] Found IR-AC-* prefix AP: %s (RSSI: %d)\n", bestSsid.c_str(), bestRssi);
+      Serial.printf("[BOOT] Candidate AP: %s RSSI=%d%s\n",
+                    targetSsid.c_str(), bestRssi,
+                    bssidMatches ? " paired" : "");
     }
   }
   WiFi.scanDelete();
 
   if (foundMaster) {
     deviceMode = MODE_STA_SLAVE;
+    setStatusLeds(true, false, true);
     WiFi.mode(WIFI_STA);
-    WiFi.begin(targetSsid, targetPass);
-    Serial.printf("[SLAVE] Connecting to %s...\n", targetSsid);
+    WiFi.begin(targetSsid.c_str(), targetPass, targetChannel,
+               targetBssidSet ? targetBssid : nullptr);
+    Serial.printf("[SLAVE] Connecting to %s%s...\n",
+                  targetSsid.c_str(), foundPaired ? " (paired BSSID)" : "");
 
     int attempts = 0;
     while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+      if (attempts % 2 == 0) {
+        LED_ON(LED_BLUE);
+        LED_OFF(LED_YELLOW);
+      } else {
+        LED_OFF(LED_BLUE);
+        LED_ON(LED_YELLOW);
+      }
       delay(500);
       Serial.print(".");
       attempts++;
@@ -1679,78 +2373,96 @@ void setup() {
       udp.endPacket();
       lastHelloSent = millis();
 
-      LED_ON(LED_YELLOW);
-      LED_ON(LED_BLUE);
+      setStatusLeds(true, false, true);
       Serial.println("=== Slave Ready ===");
+
+      // Slave health depends on the STA connection being up.
+      checkOTARollback();
     } else {
       if (allowMasterFallback) {
         Serial.println("\n[SLAVE] Connect failed, switching to Master");
+        blinkStatusLed(LED_RED, 1, 120, 80);
         deviceMode = MODE_AP_MASTER;
       } else {
-        Serial.println("\n[SLAVE] Connect failed, force_mode=slave, retrying in 3s");
-        delay(3000);
-        ESP.restart();
+        if (rollbackPendingOTA("force_mode=slave, connect failed")) return;
+        enterRecoveryAp("force_mode=slave connect failed");
       }
     }
   }
-  if (targetSsidAllocated) free((void*)targetSsid);
   }
 
   if (cfg.force_mode == FORCE_MODE_SLAVE && deviceMode != MODE_STA_SLAVE) {
-    Serial.println("[BOOT] force_mode=slave but no master found, retrying in 3s");
-    delay(3000);
-    ESP.restart();
+    if (rollbackPendingOTA("force_mode=slave, no master found")) return;
+    enterRecoveryAp("force_mode=slave no master found");
   }
   if (cfg.force_mode == FORCE_MODE_HOME && hasSTA && deviceMode != MODE_STA_HOME) {
-    Serial.println("[BOOT] force_mode=home but STA failed, retrying in 3s");
-    delay(3000);
-    ESP.restart();
+    if (rollbackPendingOTA("force_mode=home, STA failed")) return;
+    enterRecoveryAp("force_mode=home STA failed");
   }
 
   if (deviceMode == MODE_AP_MASTER) {
-    WiFi.mode(WIFI_AP);
-    IPAddress local_IP(AP_IP);
-    IPAddress gateway(AP_GATEWAY);
-    IPAddress subnet(AP_SUBNET);
-    WiFi.softAPConfig(local_IP, gateway, subnet);
-    WiFi.softAP(getApSsid(), getApPass(), 0);
-    Serial.printf("[MASTER] AP: %s  http://%s\n", getApSsid(), WiFi.softAPIP().toString().c_str());
+    setStatusLeds(false, false, true);
+    bool apStarted = startMasterAp();
 
-    dnsServer.start(53, "*", WiFi.softAPIP());
+    if (apStarted) dnsServer.start(53, "*", WiFi.softAPIP());
     irRecv.enableIRIn();
 
     registerApiRoutes();
-    // Captive Portal 路由
-    server.on("/generate_204", handleCaptive);
-    server.on("/hotspot-detect.html", handleCaptive);
-    server.on("/connecttest.txt", handleCaptive);
-    server.on("/fwlink", handleCaptive);
+    // Captive Portal — 全平台检测路径
+    server.on("/generate_204", handleCaptive);             // Android / Chrome
+    server.on("/hotspot-detect.html", handleCaptive);      // iOS / macOS
+    server.on("/library/test/success.html", handleCaptive); // macOS 旧版
+    server.on("/connecttest.txt", handleCaptive);          // Windows 10/11
+    server.on("/connecttest.htm", handleCaptive);          // Windows 旧版
+    server.on("/redirect", handleCaptive);                 // Windows 弹窗目标
+    server.on("/ncsi.txt", handleCaptive);                 // Windows NCSI
+    server.on("/fwlink", handleCaptive);                   // Windows legacy
+    server.on("/wpad.dat", handleCaptive);                 // Windows WPAD
     server.onNotFound(handleCaptive);
-    server.begin();
+    if (apStarted) server.begin();
 
-    udp.begin(UDP_PORT);
+    if (apStarted) udp.begin(UDP_PORT);
     delay(100);
-    udp.beginPacket(AP_BROADCAST, UDP_PORT);
-    udp.print("BOOT:");
-    udp.endPacket();
+    if (apStarted) {
+      udp.beginPacket(AP_BROADCAST, UDP_PORT);
+      udp.print("BOOT:");
+      udp.endPacket();
+    }
 
     for (int i = 0; i < 3; i++) {
       LED_ON(LED_BLUE); delay(100);
       LED_OFF(LED_BLUE);  delay(100);
     }
-    LED_ON(LED_YELLOW);
-    Serial.println("=== Master Ready ===");
+    setStatusLeds(false, false, true);
+    Serial.println(apStarted ? "=== Master Ready ===" : "=== Master AP Failed ===");
+
+    // AP health can only be checked after softAP/server startup.
+    checkOTARollback();
+  }
+}
+
+// 红灯状态机：OTA 快闪 > 配对慢闪 > IR 脉冲
+void updateRedLed() {
+  static unsigned long blinkAt = 0;
+  static bool on = false;
+  unsigned long now = millis();
+  if (otaState.pending || otaConfirmAt > 0) {
+    if (now >= blinkAt) { blinkAt = now + 200; on = !on; digitalWrite(LED_RED, on ? LOW : HIGH); }
+    ledBlinking = false;
+  } else if (pairingMode) {
+    if (now >= blinkAt) { blinkAt = now + 500; on = !on; digitalWrite(LED_RED, on ? LOW : HIGH); }
+    ledBlinking = false;
+  } else {
+    if (ledBlinking && now >= ledOffTime) { LED_OFF(LED_RED); ledBlinking = false; }
+    if (on) { LED_OFF(LED_RED); on = false; }
   }
 }
 
 // ===== 主循环 =====
 void loop() {
-  // LED 定时关闭（所有模式通用）
-  if (ledBlinking && millis() >= ledOffTime) {
-    LED_OFF(LED_RED);
-    ledBlinking = false;
-  }
+  updateRedLed();
 
+  confirmOTAIfReady();
   checkButton();
 
   // 从机模式：UDP 监听
@@ -1793,8 +2505,9 @@ void loop() {
 
   // AP 主机模式
   if (deviceMode == MODE_AP_MASTER) {
-    server.handleClient();
     dnsServer.processNextRequest();
+    server.handleClient();
+    updateSensors();
     handleMasterUdpReceive();
   }
 
@@ -1809,7 +2522,6 @@ void loop() {
     if (irRecv.decode(&results)) {
       irRecv.disableIRIn();
 
-      noInterrupts();
       capturedRaw = "";
       capturedRaw.reserve(results.rawlen * 6);
       for (uint16_t i = 1; i < results.rawlen; i++) {
@@ -1819,7 +2531,6 @@ void loop() {
       capturedProto = String(typeToString(results.decode_type));
       capturedBits = results.bits;
       hasNewCapture = true;
-      interrupts();
 
       Serial.printf("[IR] %s %dbit %s\n",
         capturedProto.c_str(), capturedBits, capturedRaw.substring(0, 60).c_str());

@@ -52,27 +52,31 @@ jobs:
           VERSION="${GITHUB_REF_NAME}"
           mkdir -p release
           cp firmware/flash_images/combined.bin       "release/combined-${VERSION}.bin"
-          cp firmware/.pio/build/rom0/firmware.bin    "release/firmware-rom0-${VERSION}.bin"
+          cp firmware/flash_images/rom0.bin           "release/firmware-rom0-${VERSION}.bin"
           cp firmware/flash_images/rom1.bin           "release/firmware-rom1-${VERSION}.bin"
           cp firmware/rboot-bootloader/rboot.bin      "release/rboot-${VERSION}.bin"
+          sha256sum release/*.bin > release/SHA256SUMS.txt
           ls -la release/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: release/*.bin
+          files: release/*
           draft: false
           prerelease: false
           generate_release_notes: true
           body: |
-            ## 📦 固件下载
+            ## 📦 固件下载与文件选择
 
             | 文件 | 用途 |
             |------|------|
-            | `combined-${{ github.ref_name }}.bin` | ⭐ **首选**：rboot 引导器 + ROM0 主固件合并镜像，一条 esptool 命令刷完 |
-            | `firmware-rom0-${{ github.ref_name }}.bin` | 备用：含 eboot 头的完整 PlatformIO 固件 |
-            | `firmware-rom1-${{ github.ref_name }}.bin` | **OTA 升级用**：已剥 eboot 头，通过 WebUI 上传 |
-            | `rboot-${{ github.ref_name }}.bin` | 备用：仅 rboot 引导器，需配合 rom0 分两次刷 |
+            | `combined-${{ github.ref_name }}.bin` | **首刷/救砖首选**：rboot + rboot config + ROM0，一条 esptool 命令刷到 `0x0` |
+            | `firmware-rom0-${{ github.ref_name }}.bin` | 已剥 eboot 的 ROM0 应用镜像；WebUI 显示“准备写入 ROM0”时上传 |
+            | `firmware-rom1-${{ github.ref_name }}.bin` | 已剥 eboot 的 ROM1 应用镜像；WebUI 显示“准备写入 ROM1”时上传 |
+            | `rboot-${{ github.ref_name }}.bin` | 仅 rboot 引导器；高级分步刷写时写到 `0x0000` |
+            | `SHA256SUMS.txt` | 发布文件校验值 |
+
+            **不要把 `firmware-rom0/rom1` 用 esptool 写到 `0x0`。** 这两个文件是 OTA 应用镜像，不是完整首刷镜像。
 
             ---
 
@@ -106,6 +110,8 @@ jobs:
 
             > - 把 `COMx` 换成你的实际串口（Windows 设备管理器查看；macOS/Linux 是 `/dev/ttyUSB0`）
             > - `-fm dout` 是**必须**的，用 `dio`/`qio` 会失败
+            > - 刷写完成后必须断开 IO0-GND，再重新上电；否则 ESP8266 会停在下载模式，不会启动应用和 WiFi
+            > - 只有 `combined-${{ github.ref_name }}.bin` 适合直接写到 `0x0`
 
             ### 上电测试
 
@@ -118,13 +124,28 @@ jobs:
             ## 🔄 OTA 升级（已装 v2.0+，无需 USB-TTL）
 
             1. 浏览器打开 WebUI → **设置** → **固件更新**
-            2. 选择 `firmware-rom1-${{ github.ref_name }}.bin` 上传
-            3. 等待 ~30 秒，设备自动重启
+            2. 按 WebUI「准备写入」显示的 ROM，选择对应的 `firmware-rom0-${{ github.ref_name }}.bin` 或 `firmware-rom1-${{ github.ref_name }}.bin` 上传
+            3. 页面验证通过后点上传，等待 ~30 秒，设备自动重启
             4. 新固件写入另一个分区，启动失败自动回退到旧版本（不会变砖）
+
+            OTA 页面和固件端都会校验镜像：必须是已剥 eboot 的 ESP8266 应用镜像，首段地址为 `0x40202010`，flash mode 为 `DOUT(0x03)`，大小不能超过单个 ROM slot。
+
+            > 不要上传 `combined.bin`、`rboot.bin` 或 `.pio/build/.../firmware.bin`。如果误传导致设备进不了应用代码，软件回滚无法执行，需要用 USB-TTL 重新刷 `combined-${{ github.ref_name }}.bin` 到 `0x0`。
 
             ---
 
             ## ✨ 本次更新
+
+            - 修复 rboot 双分区首刷镜像布局：`0x0000 rboot`、`0x1000 rboot config`、`0x2000 ROM0`
+            - 固定 ROM 地址：ROM0=`0x2000`，ROM1=`0x102000`
+            - 发布包中的 `firmware-rom0/rom1` 均改为已剥 eboot 的 OTA 应用镜像
+            - WebUI OTA 页面动态显示当前 ROM 和准备写入 ROM，不再写死 ROM1
+            - 增加 OTA 上传前校验和固件端二次校验，减少刷错包导致无法启动的风险
+            - 默认 AP 名称统一为 `IR-AC`
+            - 首页默认进入空调页，底部导航调整为：空调 / 遥控 / 设备 / 学习 / 设置
+            - 增加 LED 状态反馈：启动、AP 就绪、OTA pending、配对、红外活动
+            - 本机短按新增办公室预设：格力制冷 26°C 一键开/关；长按 5 秒仍为恢复出厂
+            - 补充 README 的首刷、救砖、WebUI OTA、回滚边界和发布包说明
 
             完整更新历史见 [README.md](https://github.com/${{ github.repository }}/blob/master/README.md#版本历史)
         env:

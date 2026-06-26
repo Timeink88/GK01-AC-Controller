@@ -61,7 +61,7 @@ extern "C" {
 // (magic, version and chksum (if applicable) are included
 // for you automatically), see example at end of this file
 // and customise as required
-//#define BOOT_CUSTOM_DEFAULT_CONFIG
+#define BOOT_CUSTOM_DEFAULT_CONFIG
 
 // max number of roms in the config (defaults to 4), higher
 // values will use more ram at run time
@@ -146,9 +146,14 @@ typedef struct {
 // or just plain wrong if the device has not been programmed correctly!)
 #ifdef BOOT_CUSTOM_DEFAULT_CONFIG
 static uint8_t default_config(rboot_config *romconf, uint32_t flashsize) {
+	(void)flashsize;
+	romconf->mode = MODE_STANDARD;
+	romconf->current_rom = 0;
+	romconf->gpio_rom = 0;
 	romconf->count = 2;
-	romconf->roms[0] = SECTOR_SIZE * (BOOT_CONFIG_SECTOR + 1);
-	romconf->roms[1] = (flashsize / 2) + (SECTOR_SIZE * (BOOT_CONFIG_SECTOR + 1));
+	romconf->roms[0] = 0x002000;
+	romconf->roms[1] = 0x102000;
+	return 1;
 }
 #endif
 
