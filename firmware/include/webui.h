@@ -404,7 +404,7 @@ body{background:var(--bg);color:var(--text)}
 <div style="font-size:13px;color:var(--text3);line-height:1.45">短按：格力制冷 26°C 一键开/关。长按 5 秒：恢复出厂设置。</div>
 </div></div>
 <div class="cd"><div class="cd-h">关于</div>
-<div class="it"><span>版本</span><span style="color:var(--gray)">v3.0.0</span></div>
+<div class="it"><span>版本</span><span style="color:var(--gray)">v3.1.0</span></div>
 <div class="it"><span>MAC</span><span id="sys-mac" style="color:var(--gray)">--</span></div>
 <div class="it"><span>设备</span><span style="color:var(--gray)">IR Mini V105</span></div>
 <div class="it"><span>协议库</span><span style="color:var(--gray)">IRremoteESP8266</span></div>
