@@ -82,14 +82,25 @@ bool GreeEncoder::send(const hvac::Command& cmd) {
     int temp = constrain(cmd.temp, minTemp(), maxTemp());
     frameA[0] = (uint8_t)(fanVal | modeVal);
     if (cmd.power) frameA[0] |= GREE_POWER_BIT;
+    if (cmd.sleep) frameA[0] |= 0x80;
+
     frameA[1] = (uint8_t)((temp - 16) & 0x0F);
-    frameA[7] = calcChecksum(frameA);
+
+    frameA[2] = cmd.light ? 0x20 : 0x00;
+    if (cmd.turbo) frameA[2] |= 0x10;
+    if (cmd.clean) frameA[2] |= 0x80;
+
+    frameA[7] = 0;
+    if (cmd.econo) frameA[7] |= 0x04;
+    frameA[7] |= calcChecksum(frameA);
 
     uint8_t frameB[8];
     memcpy(frameB, frameA, 8);
     frameB[3] = GREE_MSG_B;
     frameB[6] |= fanVal;
-    frameB[7] = calcChecksum(frameB);
+    frameB[7] = 0;
+    if (cmd.econo) frameB[7] |= 0x04;
+    frameB[7] |= calcChecksum(frameB);
 
     ir.disableRx();
     IRsend& s = ir.rawSender();
@@ -98,7 +109,8 @@ bool GreeEncoder::send(const hvac::Command& cmd) {
     sendFrame(s, frameB, 20000);
     ir.enableRx();
 
-    Serial.printf("[GREE] Pwr:%s Mode:%s T:%d Fan:%s\n",
-                  cmd.power ? "ON" : "OFF", cmd.mode.c_str(), temp, cmd.fan.c_str());
+    Serial.printf("[GREE] Pwr:%s Mode:%s T:%d Fan:%s T:%d E:%d S:%d L:%d C:%d\n",
+                  cmd.power ? "ON" : "OFF", cmd.mode.c_str(), temp, cmd.fan.c_str(),
+                  cmd.turbo, cmd.econo, cmd.sleep, cmd.light, cmd.clean);
     return true;
 }

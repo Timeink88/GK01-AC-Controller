@@ -4,6 +4,7 @@
 #include "config/config_store.h"
 #include "core/string_utils.h"
 #include "core/constants.h"
+#include "core/json_builder.h"
 #include "hw/ir_service.h"
 #include "hw/hvac/hvac_registry.h"
 #include "hw/sensor_service.h"
@@ -38,6 +39,11 @@ static void handleHvac() {
     c.temp   = temp;
     c.fan    = S().arg("fan");
     c.swing  = S().arg("swing");
+    c.turbo  = S().arg("turbo") == "1";
+    c.econo  = S().arg("econo") == "1";
+    c.sleep  = S().arg("sleep") == "1";
+    c.light  = S().arg("light") != "0";
+    c.clean  = S().arg("clean") == "1";
 
     bool ok = hvacRegistry.send(c);
     if (ok) {
@@ -48,11 +54,18 @@ static void handleHvac() {
         if (ctx.isApMaster()) {
             String target = S().arg("target");
             if (target.length() == 0) target = "ALL";
-            char msg[280];
+            char msg[400];
             snprintf(msg, sizeof(msg), "HVAC:%s:%s,%s,%s,%d,%s,%s",
                      target.c_str(), vendor.c_str(),
                      c.power ? "1" : "0", c.mode.c_str(), temp,
                      c.fan.c_str(), c.swing.c_str());
+            udp.broadcast(msg);
+            snprintf(msg, sizeof(msg), "HVAC2:%s:%s,%s,%s,%d,%s,%s,%d,%d,%d,%d,%d",
+                     target.c_str(), vendor.c_str(),
+                     c.power ? "1" : "0", c.mode.c_str(), temp,
+                     c.fan.c_str(), c.swing.c_str(),
+                     c.turbo ? 1 : 0, c.econo ? 1 : 0, c.sleep ? 1 : 0,
+                     c.light ? 1 : 0, c.clean ? 1 : 0);
             udp.broadcast(msg);
         }
         if (mqtt.connected()) mqtt.publishState();
@@ -63,12 +76,21 @@ static void handleHvac() {
 }
 
 static void handleHvacState() {
-    String json = "{\"vendor\":\"" + str::jsonEscape(String(configStore.cfg.last_vendor)) +
-                  "\",\"mode\":\"" + str::jsonEscape(String(configStore.cfg.last_mode)) +
-                  "\",\"temp\":" + String(configStore.cfg.last_temp) +
-                  ",\"fan\":\"" + str::jsonEscape(String(configStore.cfg.last_fan)) +
-                  "\",\"power\":" + String(configStore.cfg.last_power ? "true" : "false") + "}";
-    S().send(200, "application/json", json);
+    char buf[320];
+    JsonBuilder jb(buf, sizeof(buf));
+    jb.beginObject();
+    jb.kvString("vendor", configStore.cfg.last_vendor);
+    jb.kvString("mode",   configStore.cfg.last_mode);
+    jb.kvInt("temp",      configStore.cfg.last_temp);
+    jb.kvString("fan",    configStore.cfg.last_fan);
+    jb.kvBool("power",    configStore.cfg.last_power);
+    jb.kvBool("turbo",    configStore.cfg.last_turbo);
+    jb.kvBool("econo",    configStore.cfg.last_econo);
+    jb.kvBool("sleep",    configStore.cfg.last_sleep);
+    jb.kvBool("light",    configStore.cfg.last_light);
+    jb.kvBool("clean",    configStore.cfg.last_clean);
+    jb.endObject();
+    S().send(200, "application/json", jb.result());
 }
 
 static void handleSend() {

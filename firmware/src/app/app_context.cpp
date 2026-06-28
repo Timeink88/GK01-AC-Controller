@@ -195,6 +195,11 @@ void HvacState::applyFrom(const hvac::Command& cmd) {
     mode   = cmd.mode;
     temp   = cmd.temp;
     fan    = cmd.fan;
+    turbo  = cmd.turbo;
+    econo  = cmd.econo;
+    sleep  = cmd.sleep;
+    light  = cmd.light;
+    clean  = cmd.clean;
 }
 
 void HvacState::persistTo(Config& cfg) const {
@@ -203,6 +208,11 @@ void HvacState::persistTo(Config& cfg) const {
     cfg.last_temp  = (uint8_t)temp;
     str::copyTo(cfg.last_fan,    sizeof(cfg.last_fan),    fan);
     cfg.last_power = power;
+    cfg.last_turbo = turbo;
+    cfg.last_econo = econo;
+    cfg.last_sleep = sleep;
+    cfg.last_light = light;
+    cfg.last_clean = clean;
 }
 
 void HvacState::loadFrom(const Config& cfg) {
@@ -211,6 +221,11 @@ void HvacState::loadFrom(const Config& cfg) {
     if (strlen(cfg.last_mode) > 0) mode = cfg.last_mode;
     temp = constrain((int)cfg.last_temp, HVAC_MIN_TEMP_DEFAULT, HVAC_MAX_TEMP_DEFAULT);
     if (strlen(cfg.last_fan) > 0) fan = cfg.last_fan;
+    turbo = cfg.last_turbo;
+    econo = cfg.last_econo;
+    sleep = cfg.last_sleep;
+    light = cfg.last_light;
+    clean = cfg.last_clean;
 }
 
 void SlaveRegistry::load() {

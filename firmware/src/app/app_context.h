@@ -28,6 +28,11 @@ struct HvacState {
     String mode   = "Cool";
     int    temp   = 26;
     String fan    = "Auto";
+    bool   turbo  = false;
+    bool   econo  = false;
+    bool   sleep  = false;
+    bool   light  = true;
+    bool   clean  = false;
 
     void applyFrom(const hvac::Command& cmd);
     void persistTo(Config& cfg) const;

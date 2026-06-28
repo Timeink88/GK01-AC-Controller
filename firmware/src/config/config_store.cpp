@@ -91,6 +91,11 @@ bool ConfigStore::load() {
         else if (key == "last_temp")           cfg.last_temp = (uint8_t)val.toInt();
         else if (key == "last_fan")            copyTo(cfg.last_fan, sizeof(cfg.last_fan), sanitizeConfigValue(val, sizeof(cfg.last_fan) - 1));
         else if (key == "last_power")          cfg.last_power = (val.toInt() != 0);
+        else if (key == "last_turbo")          cfg.last_turbo = (val.toInt() != 0);
+        else if (key == "last_econo")          cfg.last_econo = (val.toInt() != 0);
+        else if (key == "last_sleep")          cfg.last_sleep = (val.toInt() != 0);
+        else if (key == "last_light")          cfg.last_light = (val.toInt() != 0);
+        else if (key == "last_clean")          cfg.last_clean = (val.toInt() != 0);
         else if (key == "device_name")         copyTo(cfg.device_name, sizeof(cfg.device_name), sanitizeMetadata(val, sizeof(cfg.device_name) - 1));
         else if (key == "device_icon")         copyTo(cfg.device_icon, sizeof(cfg.device_icon), sanitizeIconKey(val));
         else if (key == "device_floor")        copyTo(cfg.device_floor, sizeof(cfg.device_floor), sanitizeMetadata(val, sizeof(cfg.device_floor) - 1));
@@ -130,6 +135,11 @@ bool ConfigStore::save() {
     f.printf("last_temp=%d\n",           cfg.last_temp);
     f.printf("last_fan=%s\n",            cfg.last_fan);
     f.printf("last_power=%d\n",          cfg.last_power ? 1 : 0);
+    f.printf("last_turbo=%d\n",          cfg.last_turbo ? 1 : 0);
+    f.printf("last_econo=%d\n",          cfg.last_econo ? 1 : 0);
+    f.printf("last_sleep=%d\n",          cfg.last_sleep ? 1 : 0);
+    f.printf("last_light=%d\n",          cfg.last_light ? 1 : 0);
+    f.printf("last_clean=%d\n",          cfg.last_clean ? 1 : 0);
     f.printf("device_name=%s\n",         cfg.device_name);
     f.printf("device_icon=%s\n",         cfg.device_icon);
     f.printf("device_floor=%s\n",        cfg.device_floor);

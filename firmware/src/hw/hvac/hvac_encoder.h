@@ -11,6 +11,11 @@ struct Command {
     int    temp      = 26;
     String fan;
     String swing;
+    bool   turbo    = false;
+    bool   econo    = false;
+    bool   sleep    = false;
+    bool   light    = true;
+    bool   clean    = false;
 };
 
 class IEncoder {

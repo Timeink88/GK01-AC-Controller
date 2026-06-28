@@ -26,6 +26,11 @@ struct Config {
     uint8_t  last_temp      = 26;
     char     last_fan[8]    = "Auto";
     bool     last_power     = false;
+    bool     last_turbo     = false;
+    bool     last_econo     = false;
+    bool     last_sleep     = false;
+    bool     last_light     = true;
+    bool     last_clean     = false;
     char     device_name[33] = "";
     char     device_icon[12] = "ac";
     char     device_floor[33] = "";

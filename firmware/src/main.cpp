@@ -39,10 +39,16 @@ static void onButtonShortPress() {
     configStore.scheduleSave();
 
     if (ctx.isApMaster()) {
-        char msg[128];
+        char msg[400];
         snprintf(msg, sizeof(msg), "HVAC:ALL:%s,%s,%s,%d,%s,%s",
                  c.vendor.c_str(), power ? "1" : "0", c.mode.c_str(), c.temp,
                  c.fan.c_str(), c.swing.c_str());
+        udp.broadcast(msg);
+        snprintf(msg, sizeof(msg), "HVAC2:ALL:%s,%s,%s,%d,%s,%s,%d,%d,%d,%d,%d",
+                 c.vendor.c_str(), power ? "1" : "0", c.mode.c_str(), c.temp,
+                 c.fan.c_str(), c.swing.c_str(),
+                 c.turbo ? 1 : 0, c.econo ? 1 : 0, c.sleep ? 1 : 0,
+                 c.light ? 1 : 0, c.clean ? 1 : 0);
         udp.broadcast(msg);
     }
 

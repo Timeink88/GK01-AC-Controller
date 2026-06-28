@@ -52,6 +52,41 @@ void slaveExecHvac(const String& data) {
     Serial.printf("[SLAVE] %s %s %dC\n", vendor.c_str(), power ? "ON" : "OFF", temp);
 }
 
+void slaveExecHvac2(const String& data) {
+    int c[11] = {0};
+    int pos = 0;
+    for (int i = 0; i < 10; i++) {
+        c[i] = data.indexOf(',', pos);
+        if (c[i] < 0) { slaveExecHvac(data); return; }
+        pos = c[i] + 1;
+    }
+
+    hvac::Command cmd;
+    cmd.vendor = data.substring(0, c[0]);
+    cmd.power  = data.substring(c[0]+1, c[1]) == "1";
+    cmd.mode   = data.substring(c[1]+1, c[2]);
+    cmd.temp   = data.substring(c[2]+1, c[3]).toInt();
+    cmd.fan    = data.substring(c[3]+1, c[4]);
+    cmd.swing  = data.substring(c[4]+1, c[5]);
+    cmd.turbo  = data.substring(c[5]+1, c[6]) == "1";
+    cmd.econo  = data.substring(c[6]+1, c[7]) == "1";
+    cmd.sleep  = data.substring(c[7]+1, c[8]) == "1";
+    cmd.light  = data.substring(c[8]+1, c[9]) != "0";
+    cmd.clean  = data.substring(c[9]+1, c[10]) == "1";
+
+    if (cmd.temp == 0) cmd.temp = 26;
+    if (cmd.mode.length() == 0) cmd.mode = "Cool";
+    if (cmd.fan.length() == 0) cmd.fan = "Auto";
+
+    hvacRegistry.send(cmd);
+    ctx.hvacState.applyFrom(cmd);
+    ctx.hvacState.persistTo(configStore.cfg);
+    configStore.scheduleSave();
+    Serial.printf("[SLAVE2] %s %s %dC T:%d E:%d S:%d L:%d C:%d\n",
+                  cmd.vendor.c_str(), cmd.power ? "ON" : "OFF", cmd.temp,
+                  cmd.turbo, cmd.econo, cmd.sleep, cmd.light, cmd.clean);
+}
+
 void handleSlaveConfig(const String& cmd, const IPAddress& masterIp) {
     int colon = cmd.indexOf(':');
     if (colon <= 0) return;
@@ -222,6 +257,17 @@ void UdpMesh::loopSlave() {
         if (msg.startsWith("RAW:")) {
             int firstColon = msg.indexOf(':', 4);
             if (firstColon > 0) slaveExecRaw(msg.substring(firstColon + 1));
+        } else if (msg.startsWith("HVAC2:")) {
+            String payload = msg.substring(6);
+            int colon = payload.indexOf(':');
+            if (colon > 0) {
+                String target = payload.substring(0, colon);
+                String data   = payload.substring(colon + 1);
+                if (target == "ALL" ||
+                    ("," + target + ",").indexOf("," + ctx.slaveId() + ",") >= 0) {
+                    slaveExecHvac2(data);
+                }
+            }
         } else if (msg.startsWith("HVAC:")) {
             String payload = msg.substring(5);
             int colon = payload.indexOf(':');

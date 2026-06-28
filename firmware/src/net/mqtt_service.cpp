@@ -148,6 +148,17 @@ void MqttService::publishState() {
         else                                    action = "idle";
     }
     mqtt_.publish((topicBase_ + "/action").c_str(), action, true);
+
+    mqtt_.publish((topicBase_ + "/turbo_state").c_str(),
+                  ctx.hvacState.turbo ? "ON" : "OFF", true);
+    mqtt_.publish((topicBase_ + "/econo_state").c_str(),
+                  ctx.hvacState.econo ? "ON" : "OFF", true);
+    mqtt_.publish((topicBase_ + "/sleep_state").c_str(),
+                  ctx.hvacState.sleep ? "ON" : "OFF", true);
+    mqtt_.publish((topicBase_ + "/light_state").c_str(),
+                  ctx.hvacState.light ? "ON" : "OFF", true);
+    mqtt_.publish((topicBase_ + "/clean_state").c_str(),
+                  ctx.hvacState.clean ? "ON" : "OFF", true);
 }
 
 void MqttService::publishDiscovery() {

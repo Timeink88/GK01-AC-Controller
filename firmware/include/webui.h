@@ -182,6 +182,15 @@ select{background:var(--card);color:var(--text)}
 border:none;background:rgba(0,0,0,.06);font-size:22px;cursor:pointer;line-height:1;padding:0;
 display:flex;align-items:center;justify-content:center;transition:transform .12s}
 .theme-btn:active{transform:scale(.9)}
+.toggles{display:flex;flex-direction:column}
+.tg-row{display:flex;align-items:center;justify-content:space-between;padding:9px 0;border-top:.5px solid var(--gray6)}
+.tg-row:first-child{border-top:none}
+.tg-label{font-size:15px;font-weight:500}
+.tg-sub{font-size:11px;color:var(--gray);margin-top:1px}
+.tg-switch{position:relative;width:44px;height:26px;border-radius:13px;background:var(--gray4);cursor:pointer;transition:background .2s;flex-shrink:0;border:none;padding:0}
+.tg-switch.on{background:var(--green)}
+.tg-switch::after{content:'';position:absolute;top:2px;left:2px;width:22px;height:22px;border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.3);transition:transform .2s}
+.tg-switch.on::after{transform:translateX(18px)}
 @media(prefers-color-scheme:dark){.theme-btn{background:rgba(255,255,255,.1)}}
 [data-theme=light]{--bg:#f2f2f7;--card:#fff;--blue:#007AFF;--green:#34C759;--red:#FF3B30;
 --orange:#FF9500;--purple:#AF52DE;--teal:#5AC8FA;--pink:#FF2D55;
@@ -291,6 +300,13 @@ body{background:var(--bg);color:var(--text)}
 <button data-v="Low">低</button>
 <button data-v="Medium">中</button>
 <button data-v="High">高</button>
+</div></div></div>
+<div class="cd"><div class="cd-h">功能</div><div class="cd-b"><div class="toggles">
+<div class="tg-row"><div><div class="tg-label">强劲</div><div class="tg-sub">Turbo · 快速制冷/制热</div></div><button class="tg-switch" id="tg-turbo" onclick="tgToggle(this)"></button></div>
+<div class="tg-row"><div><div class="tg-label">省电</div><div class="tg-sub">Econo · 节能模式</div></div><button class="tg-switch" id="tg-econo" onclick="tgToggle(this)"></button></div>
+<div class="tg-row"><div><div class="tg-label">睡眠</div><div class="tg-sub">Sleep · 夜间安静</div></div><button class="tg-switch" id="tg-sleep" onclick="tgToggle(this)"></button></div>
+<div class="tg-row"><div><div class="tg-label">灯光</div><div class="tg-sub">Light · 面板显示</div></div><button class="tg-switch on" id="tg-light" onclick="tgToggle(this)"></button></div>
+<div class="tg-row"><div><div class="tg-label">自清洁</div><div class="tg-sub">Clean · 干燥防霉</div></div><button class="tg-switch" id="tg-clean" onclick="tgToggle(this)"></button></div>
 </div></div></div>
 <div style="display:flex;gap:10px">
 <button class="b b-bl b-fw" onclick="acCmd('On')">开机</button>
@@ -580,11 +596,16 @@ bs.forEach(function(b){b.onclick=function(){bs.forEach(function(x){x.classList.r
 }
 function segVal(id){return $(id).querySelector('.active').dataset.v}
 segInit('s-mode');segInit('s-fan');
+function tgVal(id){var el=$(id);return el&&el.classList.contains('on')?'1':'0'}
+function tgToggle(el){el.classList.toggle('on');acCmd($('tg-light').classList.contains('on')?'On':'On')}
 function tAdj(d){var e=$('t-val'),v=parseInt(e.textContent)+d;if(v<16)v=16;if(v>30)v=30;e.textContent=v;acCmd('On')}
 function acCmd(pwr){
 var tgt=getSelectedTargets();
 var p='vendor='+$('ac-v').value+'&power='+pwr+'&mode='+segVal('s-mode')+
-'&temp='+$('t-val').textContent+'&fan='+segVal('s-fan')+'&swing=Off&target='+encodeURIComponent(tgt);
+'&temp='+$('t-val').textContent+'&fan='+segVal('s-fan')+'&swing=Off'
+       +'&turbo='+tgVal('tg-turbo')+'&econo='+tgVal('tg-econo')+'&sleep='+tgVal('tg-sleep')
+       +'&light='+tgVal('tg-light')+'&clean='+tgVal('tg-clean')
+       +'&target='+encodeURIComponent(tgt);
 fetch('/api/hvac',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p})
 .then(function(r){return r.json()}).then(function(d){toast(d.ok?'\u2713':'\u2717 失败')}).catch(function(){toast('\u2717 失败')});
 }
@@ -607,6 +628,7 @@ fetch('/api/hvac/state').then(function(r){return r.json()}).then(function(d){
   if(d.temp)$('t-val').textContent=d.temp;
   if(d.mode){document.querySelectorAll('#s-mode button').forEach(function(b){b.classList.toggle('active',b.dataset.v===d.mode)})}
   if(d.fan){document.querySelectorAll('#s-fan button').forEach(function(b){b.classList.toggle('active',b.dataset.v===d.fan)})}
+['turbo','econo','sleep','light','clean'].forEach(function(k){var el=$('tg-'+k);if(el&&d[k]!==undefined)el.classList.toggle('on',!!d[k])})
 }).catch(function(){});
 function startPoll(){
 $('learn-st').textContent='监听中';

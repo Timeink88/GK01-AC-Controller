@@ -1,0 +1,51 @@
+- generic [active] [ref=e1]:
+  - heading "IR 遥控器" [level=1] [ref=e3]
+  - generic [ref=e4]:
+    - generic [ref=e5]: 设备
+    - generic [ref=e6]: 本机（主机）
+    - generic [ref=e8] [cursor=pointer]:
+      - generic [ref=e9]: 📡
+      - generic [ref=e10]: 主机
+      - generic [ref=e11]: A4:CF:12:34:56
+      - generic [ref=e12]: 主机
+    - generic [ref=e13]: 3 楼
+    - generic [ref=e14]:
+      - generic [ref=e15] [cursor=pointer]:
+        - generic [ref=e16]: 🛏️
+        - generic [ref=e17]: 卧室
+        - generic [ref=e18]: 10.1.1.2
+        - generic [ref=e19]: 在线
+      - generic [ref=e20] [cursor=pointer]:
+        - generic [ref=e21]: 📚
+        - generic [ref=e22]: 书房
+        - generic [ref=e23]: 10.1.1.3
+        - generic [ref=e24]: 在线
+    - generic [ref=e25]: 5 楼
+    - generic [ref=e26]:
+      - generic [ref=e27] [cursor=pointer]:
+        - generic [ref=e28]: 🍳
+        - generic [ref=e29]: 茶水间
+        - generic [ref=e30]: 10.1.1.4
+        - generic [ref=e31]: 在线
+      - generic [ref=e32] [cursor=pointer]:
+        - generic [ref=e33]: 📺
+        - generic [ref=e34]: 会议室
+        - generic [ref=e35]: 10.1.1.5
+        - generic [ref=e36]: 在线
+    - button "配对新设备" [ref=e38] [cursor=pointer]
+  - navigation [ref=e39]:
+    - generic [ref=e40] [cursor=pointer]:
+      - generic [ref=e41]: 🏠
+      - text: 设备
+    - generic [ref=e42] [cursor=pointer]:
+      - generic [ref=e43]: ❄️
+      - text: 空调
+    - generic [ref=e44] [cursor=pointer]:
+      - generic [ref=e45]: 📡
+      - text: 学习
+    - generic [ref=e46] [cursor=pointer]:
+      - generic [ref=e47]: 📷
+      - text: 遥控
+    - generic [ref=e48] [cursor=pointer]:
+      - generic [ref=e49]: ⚙️
+      - text: 设置

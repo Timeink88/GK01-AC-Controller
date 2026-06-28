@@ -43,7 +43,11 @@ bool IracEncoder::send(const hvac::Command& cmd) {
     st.celsius  = true;
     st.fanspeed = strToFan(cmd.fan);
     st.swingv   = strToSwing(cmd.swing);
-    st.light    = true;
+    st.light    = cmd.light;
+    st.turbo    = cmd.turbo;
+    st.econo    = cmd.econo;
+    st.sleep    = cmd.sleep ? 0 : -1;
+    st.clean    = cmd.clean;
 
     bool ok = ir.sendAc(st);
     if (ok) {
