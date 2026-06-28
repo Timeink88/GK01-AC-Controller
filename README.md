@@ -22,7 +22,9 @@
 - **状态 LED** — 上电、AP 就绪、OTA、配对、红外活动都有对应灯光反馈
 - **本机按键** — 短按格力制冷 26°C 一键开/关；长按 5 秒恢复出厂
 - **恢复出厂** — WebUI 一键恢复，或短路 D7-GND 焊盘 5 秒
-- **深色模式** — 跟随系统自动切换
+- **深色模式** — 跟随系统自动切换，也可手动锁定亮/暗（localStorage 持久化）
+- **OTA 实时进度** — WebUI 上传固件时显示实时进度条（XHR upload progress）
+- **页面动画** — 页面切换淡入动画、卡片点击缩放反馈
 - **iOS 风格界面** — 手机端优化，添加到主屏幕变成独立 App
 
 ## 界面预览
@@ -308,22 +310,69 @@ GPIO13/D7 与黄色 LED 复用，可作为本机按键/触点使用：
 
 ## 项目结构
 
+v3.0 起按领域模块化拆分，单文件 `main.cpp` 拆成 28 个文件：
+
 ```
 ├── firmware/
-│   ├── platformio.ini           # PlatformIO 配置（rboot 双分区 OTA）
-│   ├── src/main.cpp             # 主程序（AP/STA/Home 三模式 + 设备管理 + IR + UDP + MQTT）
-│   ├── include/webui.h          # iOS 风格 WebUI（PROGMEM 内嵌，5 Tab）
-│   ├── prepare_flash.py         # 生成 EA04 + IRACOTA1 OTA 包和首刷 combined 镜像
-│   ├── rboot-bootloader/        # rboot 双分区引导器（MIT）
-│   └── ld/                      # rboot 链接脚本（ROM0/ROM1）
+│   ├── platformio.ini               # PlatformIO 配置（rboot 双分区 OTA）
+│   ├── src/
+│   │   ├── main.cpp                 # 入口：setup()/loop() 框架（~90 行）
+│   │   ├── app/
+│   │   │   ├── app_context.{h,cpp}  # AppContext：聚合所有子系统 + decideBootMode
+│   │   │   └── mode_factory.{h,cpp} # DeviceMode 工厂
+│   │   ├── core/
+│   │   │   ├── pins.h               # GPIO 引脚集中定义
+│   │   │   ├── constants.h          # 间隔/超时/容量等魔数集中
+│   │   │   ├── json_builder.{h,cpp} # 栈分配 JSON 构造器（零 heap）
+│   │   │   └── string_utils.{h,cpp} # sanitize/parse/jsonEscape 工具
+│   │   ├── config/
+│   │   │   └── config_store.{h,cpp} # Config 结构 + LittleFS 持久化 + 延迟批写
+│   │   ├── hw/
+│   │   │   ├── led_manager.{h,cpp}  # 三色 LED 状态机
+│   │   │   ├── button_manager.{h,cpp} # GPIO13 复用按键（短按/长按）
+│   │   │   ├── sensor_service.{h,cpp} # DS18B20 + AM312
+│   │   │   ├── ir_service.{h,cpp}   # IR 收发互斥 + 固定缓冲捕获
+│   │   │   └── hvac/
+│   │   │       ├── hvac_encoder.h    # IEncoder 接口
+│   │   │       ├── hvac_registry.{h,cpp} # vendor → encoder 注册表
+│   │   │       ├── wahin_encoder.{h,cpp} # 华凌 R05D（Gray 码温度）
+│   │   │       ├── gree_encoder.{h,cpp}  # 格力 YBOFB（双帧 A+B）
+│   │   │       └── irac_encoder.{h,cpp}  # 通用 IRremoteESP8266 适配
+│   │   ├── net/
+│   │   │   ├── network_manager.{h,cpp} # WiFi STA/AP/重连统一
+│   │   │   ├── mqtt_service.{h,cpp}    # PubSubClient + HA discovery
+│   │   │   └── udp_mesh.{h,cpp}        # 主从 UDP 协议
+│   │   ├── web/
+│   │   │   ├── web_server.{h,cpp}      # 路由 + Captive Portal + 流式响应
+│   │   │   └── api/web_api.{h,cpp}     # 20+ API handlers
+│   │   ├── ota/ota_manager.{h,cpp}     # rboot + manifest + CRC32 + 回滚
+│   │   ├── modes/                      # DeviceMode 策略子类
+│   │   │   ├── device_mode.h           # 抽象基类
+│   │   │   ├── ap_master_mode.{h,cpp}
+│   │   │   ├── sta_slave_mode.{h,cpp}
+│   │   │   └── sta_home_mode.{h,cpp}
+│   │   ├── diag.cpp                   # 独立硬件诊断固件（factory 环境）
+│   │   └── rboot-api.cpp              # rboot SDK 桥接
+│   ├── include/webui.h                # iOS 风格 WebUI（PROGMEM 内嵌，5 Tab）
+│   ├── legacy/main_v1.cpp             # v2.x 单文件参考（不参与编译）
+│   ├── prepare_flash.py               # 生成 EA04 + IRACOTA1 OTA 包和首刷 combined 镜像
+│   ├── rboot-bootloader/              # rboot 双分区引导器（MIT）
+│   └── ld/                            # rboot 链接脚本（ROM0/ROM1）
 ├── scripts/
-│   └── make_combined.py         # 合并 rboot + ROM0 生成单文件刷写镜像
-├── screenshots/                 # WebUI 界面截图
+│   └── make_combined.py               # 合并 rboot + ROM0 生成单文件刷写镜像
+├── screenshots/                       # WebUI 界面截图
 ├── .github/workflows/
-│   ├── ci.yml                   # push 自动编译验证
-│   └── release.yml              # tag 自动编译 + 发 GitHub Release
+│   ├── ci.yml                         # push 自动编译验证
+│   └── release.yml                    # tag 自动编译 + 发 GitHub Release
 └── README.md
 ```
+
+### 架构要点
+
+- **DeviceMode 策略模式**：`ApMasterMode` / `StaSlaveMode` / `StaHomeMode` 继承 `DeviceMode` 基类，消除散布的 `if (deviceMode == ...)` 分支，新增模式只需加一个子类
+- **HvacEncoder 注册表**：`GREE` / `WAHIN` 走自研编码器，其他品牌走 `IRremoteESP8266` 通用路径；新增品牌只需实现 `IEncoder` 接口并注册一行
+- **AppContext 协调**：聚合所有子系统（config/leds/sensors/ir/hvac/network/mqtt/udp/web/ota），消除 141 个 free-floating 全局变量
+- **向后兼容**：API 路由、UDP 协议、MQTT topic、LittleFS 配置文件格式、OTA manifest 完全保持，旧固件升级不需要擦除配置
 
 ## 技术栈
 
@@ -361,6 +410,7 @@ GPIO13/D7 与黄色 LED 复用，可作为本机按键/触点使用：
 | v2.2 | AP 热点名称/密码可配置、从机自适应组网、短路 D7-GND 恢复出厂、WebUI 恢复出厂设置 |
 | v2.3 | AP 热点配置、强制模式切换、从机列表+配对模式、WebUI 显示 MAC |
 | v2.4 | 设备管理（楼层分组/命名/图标）、多选控制、定向 IR、远程配置从机、空调状态持久化、深色模式、rboot `EA 04` OTA 镜像、`IRACOTA1` manifest + CRC32 防误刷、LED 状态反馈、短按办公室预设 |
+| v3.0 | 架构重写：3001 行单文件拆分为 28 个模块化文件（按领域分层 app/core/config/hw/net/web/ota/modes）；DeviceMode 策略模式替代 if 分支；HvacEncoder 注册表替代 vendor if 链；HvacState 单一状态源；UI 升级（OTA 实时进度条/手动暗色模式/页面切换动画）；体积 600KB → 584KB；行为 100% 向后兼容 |
 
 ## 许可证
 
